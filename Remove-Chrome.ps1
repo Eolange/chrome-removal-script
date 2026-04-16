@@ -159,25 +159,45 @@ if (-not $chromePaths) {
         Write-Log SUCCESS "ACL dossier réinitialisé (héritage normal) : $chromeAppDir"
 
         # Bloquer chaque .exe : propriété admin + Users en Read seul (pas d'exécution)
+        # On utilise les SIDs pour éviter les problèmes de langue (FR/EN)
+        # S-1-5-32-544 = Administrators/Administrateurs
+        # S-1-5-18     = SYSTEM
+        # S-1-5-32-545 = Users/Utilisateurs
         $exeFiles = Get-ChildItem -LiteralPath $chromeDir -Filter '*.exe' -ErrorAction SilentlyContinue
         foreach ($exe in $exeFiles) {
             $exePath = $exe.FullName
-            # 1. Prendre possession pour Administrators
-            & takeown /F $exePath /A 2>$null | Out-Null
-            # 2. Couper l'héritage + supprimer toutes les permissions
-            & icacls $exePath /inheritance:r 2>$null | Out-Null
-            # 3. Donner FullControl aux admins et SYSTEM
-            & icacls $exePath /grant "$($AdminGroup):(F)" 2>$null | Out-Null
-            & icacls $exePath /grant "SYSTEM:(F)" 2>$null | Out-Null
-            # 4. Users : Read seul (R = lire, pas RX = lire+exécuter)
-            & icacls $exePath /grant "$($UsersGroup):(R)" 2>$null | Out-Null
+            Write-Log INFO "  Traitement : $($exe.Name)"
 
-            # Vérifier le résultat
-            $check = & icacls $exePath 2>$null
-            if ($check -match $AdminGroup) {
-                Write-Log SUCCESS "ACL bloqué : $($exe.Name) ($AdminGroup=Full, $UsersGroup=Read)"
+            # 1. Prendre possession pour Administrators
+            $r = & takeown /F $exePath /A 2>&1
+            Write-Log INFO "    takeown: $r"
+
+            # 2. AVANT de couper l'héritage : donner FullControl aux admins et SYSTEM
+            #    (sinon après /inheritance:r plus personne n'a accès et les /grant échouent)
+            $r = & icacls $exePath /grant "*S-1-5-32-544:(F)" 2>&1
+            Write-Log INFO "    grant Admins: $r"
+            $r = & icacls $exePath /grant "*S-1-5-18:(F)" 2>&1
+            Write-Log INFO "    grant SYSTEM: $r"
+
+            # 3. Maintenant couper l'héritage (les grants explicites ci-dessus survivent)
+            $r = & icacls $exePath /inheritance:r 2>&1
+            Write-Log INFO "    inheritance:r: $r"
+
+            # 4. Users : Read seul (R = lire, PAS RX = lire+exécuter)
+            $r = & icacls $exePath /grant "*S-1-5-32-545:(R)" 2>&1
+            Write-Log INFO "    grant Users(R): $r"
+
+            # 5. Vérifier le résultat
+            $check = & icacls $exePath
+            Write-Log INFO "    Permissions finales :"
+            $check | ForEach-Object { if ($_ -match 'S-1-5|BUILTIN|NT AUTHORITY|Admini|Users|Utilisat') { Write-Log INFO "      $_" } }
+
+            $hasAdmin = $check -match 'S-1-5-32-544'
+            $hasSystem = $check -match 'S-1-5-18'
+            if ($hasAdmin -and $hasSystem) {
+                Write-Log SUCCESS "ACL OK : $($exe.Name)"
             } else {
-                Write-Log ERROR "ACL possiblement échoué sur $($exe.Name)"
+                Write-Log ERROR "ACL ECHOUE sur $($exe.Name) — vérifier manuellement avec: icacls `"$exePath`""
             }
         }
     }
