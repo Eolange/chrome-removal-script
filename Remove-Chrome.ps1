@@ -32,26 +32,6 @@ function Get-LocalGroupName {
     return $EnglishName
 }
 
-# Prise de possession + modification ACL en DEUX étapes (sinon Access Denied)
-function Set-AclSafe {
-    param(
-        [string]$Path,
-        [System.Security.Principal.NTAccount]$Owner,
-        [System.Security.AccessControl.FileSystemAccessRule[]]$Rules
-    )
-    # Étape 1 : prendre possession
-    $acl = Get-Acl -LiteralPath $Path
-    $acl.SetOwner($Owner)
-    Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
-
-    # Étape 2 : relire l'ACL (en tant que propriétaire) puis modifier les règles
-    $acl = Get-Acl -LiteralPath $Path
-    $acl.SetAccessRuleProtection($true, $false)   # couper l'héritage, ne pas copier
-    foreach ($r in @($acl.Access)) { $acl.RemoveAccessRule($r) | Out-Null }
-    foreach ($r in $Rules) { $acl.AddAccessRule($r) }
-    Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
-}
-
 $AdminGroup = Get-LocalGroupName -EnglishName 'Administrators' -FrenchName 'Administrateurs'
 $UsersGroup = Get-LocalGroupName -EnglishName 'Users' -FrenchName 'Utilisateurs'
 #endregion
@@ -158,7 +138,7 @@ foreach ($dir in "${env:ProgramFiles(x86)}\Google\Update", "${env:ProgramFiles}\
 }
 #endregion
 
-#region 5. Bloquer chrome.exe par ACL + SRP
+#region 5. Bloquer chrome.exe par ACL (icacls) + SRP
 $chromePaths = @(
     "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
     "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe"
@@ -167,63 +147,38 @@ $chromePaths = @(
 if (-not $chromePaths) {
     Write-Log INFO "Chrome n'est pas installé sur ce poste."
 } else {
-    # Activer les privilèges nécessaires pour prendre possession
-    $tokenPrivCode = @'
-using System;
-using System.Runtime.InteropServices;
-public class TokenPriv {
-    [DllImport("advapi32.dll", SetLastError=true)]
-    static extern bool AdjustTokenPrivileges(IntPtr h, bool d, ref TP n, int l, IntPtr p, IntPtr r);
-    [DllImport("advapi32.dll", SetLastError=true)]
-    static extern bool OpenProcessToken(IntPtr h, uint a, out IntPtr t);
-    [DllImport("advapi32.dll", SetLastError=true)]
-    static extern bool LookupPrivilegeValue(string s, string n, out long l);
-    struct TP { public int Count; public long Luid; public int Attr; }
-    public static void Enable(string priv) {
-        IntPtr token; long luid;
-        OpenProcessToken((IntPtr)(-1), 0x28, out token);
-        LookupPrivilegeValue(null, priv, out luid);
-        TP tp = new TP { Count = 1, Luid = luid, Attr = 2 };
-        AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
-    }
-}
-'@
-    try { Add-Type $tokenPrivCode -ErrorAction SilentlyContinue } catch {}
-    try { [TokenPriv]::Enable('SeTakeOwnershipPrivilege'); [TokenPriv]::Enable('SeRestorePrivilege') } catch {}
-
-    $adminAccount = New-Object System.Security.Principal.NTAccount($AdminGroup)
-
-    # Règles ACL pour les DOSSIERS (admins + SYSTEM full, Users lecture+listage)
-    $dirRules = @(
-        (New-Object System.Security.AccessControl.FileSystemAccessRule($AdminGroup, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')),
-        (New-Object System.Security.AccessControl.FileSystemAccessRule('SYSTEM',     'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')),
-        (New-Object System.Security.AccessControl.FileSystemAccessRule($UsersGroup,  'ReadAndExecute,ListDirectory', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
-    )
-
-    # Règles ACL pour les EXE (admins + SYSTEM full, Users lecture SEULE = pas d'exécution)
-    $exeRules = @(
-        (New-Object System.Security.AccessControl.FileSystemAccessRule($AdminGroup, 'FullControl', 'None', 'None', 'Allow')),
-        (New-Object System.Security.AccessControl.FileSystemAccessRule('SYSTEM',     'FullControl', 'None', 'None', 'Allow')),
-        (New-Object System.Security.AccessControl.FileSystemAccessRule($UsersGroup,  'Read',        'None', 'None', 'Allow'))
-    )
-
     foreach ($chromeExe in $chromePaths) {
-        $chromeAppDir = Split-Path (Split-Path $chromeExe -Parent) -Parent
+        $chromeDir = Split-Path $chromeExe -Parent
         Write-Log INFO "Blocage de : $chromeExe"
 
-        try {
-            # ACL dossier
-            Set-AclSafe -Path $chromeAppDir -Owner $adminAccount -Rules $dirRules
-            Write-Log SUCCESS "ACL dossier OK : $chromeAppDir"
+        # D'abord : réparer le dossier parent si un ancien script a cassé ses ACL
+        $chromeAppDir = Split-Path $chromeDir -Parent
+        Write-Log INFO "Réparation ACL dossier : $chromeAppDir"
+        & takeown /F $chromeAppDir /A /R /D O 2>$null | Out-Null
+        & icacls $chromeAppDir /reset /T /Q 2>$null | Out-Null
+        Write-Log SUCCESS "ACL dossier réinitialisé (héritage normal) : $chromeAppDir"
 
-            # ACL sur chaque .exe (bloquer exécution pour Users)
-            foreach ($exe in (Get-ChildItem (Split-Path $chromeExe -Parent) -Filter '*.exe' -ErrorAction SilentlyContinue)) {
-                Set-AclSafe -Path $exe.FullName -Owner $adminAccount -Rules $exeRules
-                Write-Log SUCCESS "ACL exe bloqué : $($exe.Name)"
+        # Bloquer chaque .exe : propriété admin + Users en Read seul (pas d'exécution)
+        $exeFiles = Get-ChildItem -LiteralPath $chromeDir -Filter '*.exe' -ErrorAction SilentlyContinue
+        foreach ($exe in $exeFiles) {
+            $exePath = $exe.FullName
+            # 1. Prendre possession pour Administrators
+            & takeown /F $exePath /A 2>$null | Out-Null
+            # 2. Couper l'héritage + supprimer toutes les permissions
+            & icacls $exePath /inheritance:r 2>$null | Out-Null
+            # 3. Donner FullControl aux admins et SYSTEM
+            & icacls $exePath /grant "$($AdminGroup):(F)" 2>$null | Out-Null
+            & icacls $exePath /grant "SYSTEM:(F)" 2>$null | Out-Null
+            # 4. Users : Read seul (R = lire, pas RX = lire+exécuter)
+            & icacls $exePath /grant "$($UsersGroup):(R)" 2>$null | Out-Null
+
+            # Vérifier le résultat
+            $check = & icacls $exePath 2>$null
+            if ($check -match $AdminGroup) {
+                Write-Log SUCCESS "ACL bloqué : $($exe.Name) ($AdminGroup=Full, $UsersGroup=Read)"
+            } else {
+                Write-Log ERROR "ACL possiblement échoué sur $($exe.Name)"
             }
-        }
-        catch {
-            Write-Log ERROR "Blocage ACL échoué : $($_.Exception.Message)"
         }
     }
 
