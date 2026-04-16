@@ -174,35 +174,38 @@ if (-not $chromePaths) {
         Write-Log SUCCESS "  Dossier restauré en permissions normales."
 
         # 3. Sur chaque .exe : bloquer l'exécution pour les non-admins
-        #    On utilise les SIDs (universels, marchent sur Windows FR et EN) :
-        #      *S-1-5-32-544 = Administrators/Administrateurs
-        #      *S-1-5-18     = SYSTEM
-        #      *S-1-5-32-545 = Users/Utilisateurs
-        #      *S-1-5-11     = Authenticated Users / Utilisateurs authentifiés
+        #    Méthode : couper l'héritage + permissions explicites uniquement
+        #    Admins et SYSTEM = FullControl, Users = rien du tout
+        #    PAS de Deny (un Deny bloquerait aussi l'admin élevé car il est membre de Users)
         $exeFiles = Get-ChildItem -LiteralPath $chromeDir -Filter '*.exe' -ErrorAction SilentlyContinue
         foreach ($exe in $exeFiles) {
             $exePath = $exe.FullName
             Write-Log INFO "  Traitement : $($exe.Name)"
 
-            # a) Donner FullControl explicite aux admins et SYSTEM (via SID)
+            # a) D'abord : supprimer tous les anciens Deny qui bloquent tout le monde
+            $r = & icacls $exePath /remove:d '*S-1-5-32-545' 2>&1
+            Write-Log INFO "    remove deny Users: $($r | Select-Object -First 1)"
+            $r = & icacls $exePath /remove:d '*S-1-5-11' 2>&1
+            Write-Log INFO "    remove deny AuthUsers: $($r | Select-Object -First 1)"
+
+            # b) Donner FullControl explicite aux Admins et SYSTEM (AVANT de couper l'héritage)
             $r = & icacls $exePath /grant '*S-1-5-32-544:(F)' 2>&1
             Write-Log INFO "    grant Admins(F): $($r | Select-Object -First 1)"
             $r = & icacls $exePath /grant '*S-1-5-18:(F)' 2>&1
             Write-Log INFO "    grant SYSTEM(F): $($r | Select-Object -First 1)"
 
-            # b) Deny ReadAndExecute pour Users ET Authenticated Users (via SID)
-            #    Deny est TOUJOURS prioritaire sur Allow, même hérité.
-            #    Les admins passent quand même car ils ont un Allow explicite
-            #    ET leur token élevé contourne le Deny du groupe Users.
-            $r = & icacls $exePath /deny '*S-1-5-32-545:(RX)' 2>&1
-            Write-Log INFO "    deny Users(RX): $($r | Select-Object -First 1)"
-            $r = & icacls $exePath /deny '*S-1-5-11:(RX)' 2>&1
-            Write-Log INFO "    deny AuthUsers(RX): $($r | Select-Object -First 1)"
+            # c) Couper l'héritage (les grants explicites ci-dessus survivent)
+            $r = & icacls $exePath /inheritance:r 2>&1
+            Write-Log INFO "    inheritance:r: $($r | Select-Object -First 1)"
 
-            # c) Vérifier
+            # d) PAS de grant pour Users = les users n'ont AUCUN droit sur le .exe
+            #    Seuls Admins et SYSTEM peuvent y accéder
+
+            # e) Vérifier
             $check = & icacls $exePath
             Write-Log INFO "    Permissions finales :"
             $check | ForEach-Object { if ($_.Trim()) { Write-Log INFO "      $_" } }
+        }
         }
     }
 }
