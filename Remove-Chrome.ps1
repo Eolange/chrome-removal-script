@@ -358,35 +358,98 @@ function Invoke-ChromeTaskbarAutoRepair {
     else {
         Write-Log 'SUCCESS' "$totalRemoved raccourci(s) Chrome résiduel(s) supprimé(s)."
     }
-    # 2. Arrêter explorer pour libérer les fichiers cache
-    $explorerProcs = Get-Process explorer -ErrorAction SilentlyContinue
-    if ($explorerProcs) {
-        $explorerProcs | Stop-Process -Force -ErrorAction SilentlyContinue
-        Write-Log 'INFO' 'Explorer arrêté pour nettoyage du cache.'
-        Start-Sleep -Seconds 2
-    }
-    # 3. Nettoyer le cache d'icônes de chaque profil (fichiers déverrouillés car explorer est arrêté)
-    foreach ($profile in $profiles) {
-        $explorerCacheDir = Join-Path $profile.LocalPath 'AppData\Local\Microsoft\Windows\Explorer'
-        $iconDb = Join-Path $profile.LocalPath 'AppData\Local\IconCache.db'
-        try {
-            if (Test-Path -LiteralPath $explorerCacheDir) {
-                Get-ChildItem -LiteralPath $explorerCacheDir -Filter 'iconcache_*' -Force -ErrorAction SilentlyContinue |
-                    Remove-Item -Force -ErrorAction SilentlyContinue
-                Write-Log 'SUCCESS' "Cache icônes supprimé : $explorerCacheDir"
-            }
-            if (Test-Path -LiteralPath $iconDb) {
-                Remove-Item -LiteralPath $iconDb -Force -ErrorAction SilentlyContinue
-                Write-Log 'SUCCESS' "IconCache.db supprimé : $iconDb"
+    # 2. Tenter un désépinglage immédiat via Register-ScheduledTask (cmdlet PS, pas schtasks.exe)
+    $immediateOk = $false
+    try {
+        $computerSystem = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+        $interactiveUser = $computerSystem.UserName
+        if ($interactiveUser) {
+            $userNameOnly = $interactiveUser.Split('\')[-1]
+            $userProfile = $profiles | Where-Object { $_.LocalPath -match [regex]::Escape($userNameOnly) } | Select-Object -First 1
+            if ($userProfile) {
+                $vbsPath = Join-Path $userProfile.LocalPath 'AppData\Local\Temp\UnpinChrome.vbs'
+                $vbsContent = @"
+Set sh = CreateObject(""Shell.Application"")
+Set wsh = CreateObject(""WScript.Shell"")
+tb = wsh.ExpandEnvironmentStrings(""%APPDATA%"") & ""\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar""
+Set fso = CreateObject(""Scripting.FileSystemObject"")
+If fso.FolderExists(tb) Then
+    Set folder = sh.Namespace(tb)
+    If Not folder Is Nothing Then
+        For Each item In folder.Items
+            nm = LCase(item.Name)
+            If InStr(nm, ""chrome"") > 0 Then
+                For Each verb In item.Verbs
+                    If InStr(verb.Name, ""pingler"") > 0 Or InStr(verb.Name, ""Unpin"") > 0 Then
+                        verb.DoIt
+                    End If
+                Next
+            End If
+        Next
+    End If
+End If
+fso.DeleteFile WScript.ScriptFullName, True
+"@
+                Set-Content -Path $vbsPath -Value $vbsContent -Encoding ASCII -Force
+                $taskName = 'UnpinChromeImmediate'
+                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+                $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbsPath`""
+                $principal = New-ScheduledTaskPrincipal -UserId $interactiveUser -LogonType Interactive -RunLevel Limited
+                $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+                Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+                Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+                Write-Log 'SUCCESS' "Désépinglage immédiat lancé dans la session de $interactiveUser"
+                $immediateOk = $true
+                Start-Sleep -Seconds 3
+                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
             }
         }
-        catch {
-            Write-Log 'WARNING' "Nettoyage cache impossible pour $($profile.LocalPath) : $($_.Exception.Message)"
+    }
+    catch {
+        Write-Log 'WARNING' "Désépinglage immédiat impossible : $($_.Exception.Message)"
+    }
+    # 3. Fallback : enregistrer RunOnce pour le prochain logon
+    if (-not $immediateOk) {
+        foreach ($profile in $profiles) {
+            if (-not $profile.Loaded) { continue }
+            $sid = $profile.SID
+            $runOncePath = "Registry::HKU\$sid\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+            try {
+                if (-not (Test-Path $runOncePath)) {
+                    New-Item -Path $runOncePath -Force -ErrorAction Stop | Out-Null
+                }
+                $vbsPath = Join-Path $profile.LocalPath 'AppData\Local\Temp\UnpinChrome.vbs'
+                $vbsContent = @"
+Set sh = CreateObject(""Shell.Application"")
+Set wsh = CreateObject(""WScript.Shell"")
+tb = wsh.ExpandEnvironmentStrings(""%APPDATA%"") & ""\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar""
+Set fso = CreateObject(""Scripting.FileSystemObject"")
+If fso.FolderExists(tb) Then
+    Set folder = sh.Namespace(tb)
+    If Not folder Is Nothing Then
+        For Each item In folder.Items
+            nm = LCase(item.Name)
+            If InStr(nm, ""chrome"") > 0 Then
+                For Each verb In item.Verbs
+                    If InStr(verb.Name, ""pingler"") > 0 Or InStr(verb.Name, ""Unpin"") > 0 Then
+                        verb.DoIt
+                    End If
+                Next
+            End If
+        Next
+    End If
+End If
+fso.DeleteFile WScript.ScriptFullName, True
+"@
+                Set-Content -Path $vbsPath -Value $vbsContent -Encoding ASCII -Force
+                Set-ItemProperty -Path $runOncePath -Name 'UnpinChrome' -Value "wscript.exe `"$vbsPath`"" -Type String -ErrorAction Stop
+                Write-Log 'SUCCESS' "RunOnce enregistré : l''icône Chrome sera supprimée au prochain logon (SID: $sid)"
+            }
+            catch {
+                Write-Log 'WARNING' "Impossible d''enregistrer RunOnce pour SID $sid : $($_.Exception.Message)"
+            }
         }
     }
-    # 4. Relancer explorer
-    Start-Process explorer.exe -ErrorAction SilentlyContinue
-    Write-Log 'INFO' 'Explorer relancé après nettoyage du cache.'
 }
 
 function Set-ChromeRestrictionAcl {
@@ -461,10 +524,13 @@ public class TokenPriv {
             $adminGroup, 'FullControl', 'None', 'None', 'Allow')
         $exeSystemRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
             'SYSTEM', 'FullControl', 'None', 'None', 'Allow')
+        $exeUsersReadRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $usersGroup, 'Read', 'None', 'None', 'Allow')
         $exeAcl.AddAccessRule($exeAdminRule)
         $exeAcl.AddAccessRule($exeSystemRule)
+        $exeAcl.AddAccessRule($exeUsersReadRule)
         Set-Acl -LiteralPath $ChromeExePath -AclObject $exeAcl -ErrorAction Stop
-        Write-Log 'SUCCESS' "ACL chrome.exe : seuls $adminGroup + SYSTEM peuvent exécuter"
+        Write-Log 'SUCCESS' "ACL chrome.exe : $adminGroup + SYSTEM FullControl, $usersGroup Read seul (pas d''exécution)"
         # Bloquer aussi new_chrome.exe et chrome_proxy.exe s'ils existent
         $otherExes = @('new_chrome.exe', 'chrome_proxy.exe')
         foreach ($exeName in $otherExes) {
@@ -479,6 +545,7 @@ public class TokenPriv {
                     foreach ($rule in @($otherAcl.Access)) { $otherAcl.RemoveAccessRule($rule) | Out-Null }
                     $otherAcl.AddAccessRule($exeAdminRule)
                     $otherAcl.AddAccessRule($exeSystemRule)
+                    $otherAcl.AddAccessRule($exeUsersReadRule)
                     Set-Acl -LiteralPath $otherExePath -AclObject $otherAcl -ErrorAction Stop
                     Write-Log 'SUCCESS' "ACL bloquée sur $exeName"
                 }
@@ -489,13 +556,13 @@ public class TokenPriv {
         }
         # Vérification sur chrome.exe
         $testAcl = Get-Acl -LiteralPath $ChromeExePath
-        $nonAdmin = $testAcl.Access | Where-Object { $_.IdentityReference -notmatch "SYSTEM|Syst.me|AUTORITE|$([regex]::Escape($adminGroup))|BUILTIN" }
+        $nonAdmin = $testAcl.Access | Where-Object { $_.IdentityReference -notmatch "SYSTEM|Syst.me|AUTORITE|$([regex]::Escape($adminGroup))|$([regex]::Escape($usersGroup))|BUILTIN" }
         if ($nonAdmin) {
-            Write-Log 'WARNING' "ACL vérification chrome.exe : des permissions non-admin subsistent"
+            Write-Log 'WARNING' "ACL vérification chrome.exe : des permissions inattendues"
             $nonAdmin | ForEach-Object { Write-Log 'WARNING' "  -> $($_.IdentityReference) : $($_.FileSystemRights)" }
         }
         else {
-            Write-Log 'SUCCESS' "ACL vérification OK : chrome.exe accessible uniquement par $adminGroup + SYSTEM"
+            Write-Log 'SUCCESS' "ACL vérification OK : chrome.exe ($adminGroup + SYSTEM FullControl, $usersGroup Read)"
         }
     }
     catch {
