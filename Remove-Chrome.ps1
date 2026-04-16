@@ -5,8 +5,10 @@
 .DESCRIPTION
     - Arrête les processus Chrome
     - Supprime les raccourcis (bureau, taskbar, menu démarrer)
+    - Désépingle Chrome de la barre des tâches (verbe Shell COM)
     - Désactive les tâches planifiées et services Google Update
     - Bloque chrome.exe par ACL (lecture seule pour Users) + SRP
+    - Les admins conservent un accès complet
 #>
 [CmdletBinding()]
 param()
@@ -30,6 +32,26 @@ function Get-LocalGroupName {
     return $EnglishName
 }
 
+# Prise de possession + modification ACL en DEUX étapes (sinon Access Denied)
+function Set-AclSafe {
+    param(
+        [string]$Path,
+        [System.Security.Principal.NTAccount]$Owner,
+        [System.Security.AccessControl.FileSystemAccessRule[]]$Rules
+    )
+    # Étape 1 : prendre possession
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetOwner($Owner)
+    Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+
+    # Étape 2 : relire l'ACL (en tant que propriétaire) puis modifier les règles
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetAccessRuleProtection($true, $false)   # couper l'héritage, ne pas copier
+    foreach ($r in @($acl.Access)) { $acl.RemoveAccessRule($r) | Out-Null }
+    foreach ($r in $Rules) { $acl.AddAccessRule($r) }
+    Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+}
+
 $AdminGroup = Get-LocalGroupName -EnglishName 'Administrators' -FrenchName 'Administrateurs'
 $UsersGroup = Get-LocalGroupName -EnglishName 'Users' -FrenchName 'Utilisateurs'
 #endregion
@@ -44,12 +66,11 @@ if ($procs) {
 }
 #endregion
 
-#region 2. Supprimer les raccourcis
+#region 2. Supprimer les raccourcis bureau + menu démarrer
 $shortcutPaths = @(
     "$env:PUBLIC\Desktop\Google Chrome.lnk",
     "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Google Chrome.lnk"
 )
-# Ajouter les raccourcis de chaque profil utilisateur
 Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue | ForEach-Object {
     $shortcutPaths += Join-Path $_.FullName 'Desktop\Google Chrome.lnk'
 }
@@ -60,13 +81,40 @@ foreach ($path in $shortcutPaths) {
         Write-Log SUCCESS "Raccourci supprimé : $path"
     }
 }
+#endregion
 
-# Nettoyer la taskbar et Quick Launch (tous les profils)
+#region 3. Désépingler Chrome de la barre des tâches
 $wsh = New-Object -ComObject WScript.Shell -ErrorAction SilentlyContinue
+$shell = New-Object -ComObject Shell.Application -ErrorAction SilentlyContinue
+
 Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue | ForEach-Object {
     $qlRoot = Join-Path $_.FullName 'AppData\Roaming\Microsoft\Internet Explorer\Quick Launch'
     if (-not (Test-Path -LiteralPath $qlRoot)) { return }
 
+    # Sous-dossiers à nettoyer
+    $taskbarDir = Join-Path $qlRoot 'User Pinned\TaskBar'
+
+    # a) Désépingler via verbe Shell COM (seule méthode fiable pour retirer l'icône)
+    if ($shell -and (Test-Path -LiteralPath $taskbarDir)) {
+        $folder = $shell.Namespace($taskbarDir)
+        if ($folder) {
+            foreach ($item in $folder.Items()) {
+                $name = $item.Name
+                if ($name -match 'chrome') {
+                    foreach ($verb in $item.Verbs()) {
+                        # FR: "Désépingler de la barre des tâches" / EN: "Unpin from taskbar"
+                        if ($verb.Name -match 'pingler|Unpin|taskbar') {
+                            $verb.DoIt()
+                            Write-Log SUCCESS "Désépinglé de la taskbar : $name"
+                            break
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    # b) Supprimer les fichiers .lnk Chrome résiduels (taskbar + Quick Launch)
     Get-ChildItem -LiteralPath $qlRoot -Filter '*.lnk' -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
         $isChrome = $_.Name -match 'chrome'
         if (-not $isChrome -and $wsh) {
@@ -78,9 +126,15 @@ Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue | ForEach-Obje
         }
     }
 }
+
+# Redémarrer Explorer pour forcer le rafraîchissement de la barre des tâches
+Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+Start-Process explorer.exe -ErrorAction SilentlyContinue
+Write-Log INFO 'Explorer redémarré (rafraîchissement taskbar).'
 #endregion
 
-#region 3. Désactiver tâches planifiées et services Google
+#region 4. Désactiver tâches planifiées et services Google
 Get-ScheduledTask -ErrorAction SilentlyContinue |
     Where-Object { $_.TaskName -match 'chrome|google' } |
     ForEach-Object {
@@ -96,7 +150,6 @@ Get-Service -ErrorAction SilentlyContinue |
         Write-Log SUCCESS "Service désactivé : $($_.Name)"
     }
 
-# Supprimer Google Update
 foreach ($dir in "${env:ProgramFiles(x86)}\Google\Update", "${env:ProgramFiles}\Google\Update") {
     if (Test-Path -LiteralPath $dir) {
         Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
@@ -105,7 +158,7 @@ foreach ($dir in "${env:ProgramFiles(x86)}\Google\Update", "${env:ProgramFiles}\
 }
 #endregion
 
-#region 4. Bloquer chrome.exe par ACL + SRP
+#region 5. Bloquer chrome.exe par ACL + SRP
 $chromePaths = @(
     "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
     "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe"
@@ -114,7 +167,7 @@ $chromePaths = @(
 if (-not $chromePaths) {
     Write-Log INFO "Chrome n'est pas installé sur ce poste."
 } else {
-    # Activer les privilèges nécessaires
+    # Activer les privilèges nécessaires pour prendre possession
     $tokenPrivCode = @'
 using System;
 using System.Runtime.InteropServices;
@@ -140,32 +193,32 @@ public class TokenPriv {
 
     $adminAccount = New-Object System.Security.Principal.NTAccount($AdminGroup)
 
+    # Règles ACL pour les DOSSIERS (admins + SYSTEM full, Users lecture+listage)
+    $dirRules = @(
+        (New-Object System.Security.AccessControl.FileSystemAccessRule($AdminGroup, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')),
+        (New-Object System.Security.AccessControl.FileSystemAccessRule('SYSTEM',     'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')),
+        (New-Object System.Security.AccessControl.FileSystemAccessRule($UsersGroup,  'ReadAndExecute,ListDirectory', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
+    )
+
+    # Règles ACL pour les EXE (admins + SYSTEM full, Users lecture SEULE = pas d'exécution)
+    $exeRules = @(
+        (New-Object System.Security.AccessControl.FileSystemAccessRule($AdminGroup, 'FullControl', 'None', 'None', 'Allow')),
+        (New-Object System.Security.AccessControl.FileSystemAccessRule('SYSTEM',     'FullControl', 'None', 'None', 'Allow')),
+        (New-Object System.Security.AccessControl.FileSystemAccessRule($UsersGroup,  'Read',        'None', 'None', 'Allow'))
+    )
+
     foreach ($chromeExe in $chromePaths) {
         $chromeAppDir = Split-Path (Split-Path $chromeExe -Parent) -Parent
         Write-Log INFO "Blocage de : $chromeExe"
 
         try {
-            # ACL dossier : lisible par tous, modifiable par admins
-            $dirAcl = Get-Acl -LiteralPath $chromeAppDir
-            $dirAcl.SetOwner($adminAccount)
-            $dirAcl.SetAccessRuleProtection($true, $false)
-            $dirAcl.Access | ForEach-Object { $dirAcl.RemoveAccessRule($_) | Out-Null }
-            $dirAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($AdminGroup, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
-            $dirAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('SYSTEM', 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
-            $dirAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($UsersGroup, 'ReadAndExecute,ListDirectory', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
-            Set-Acl -LiteralPath $chromeAppDir -AclObject $dirAcl
-            Write-Log SUCCESS "ACL dossier : $chromeAppDir"
+            # ACL dossier
+            Set-AclSafe -Path $chromeAppDir -Owner $adminAccount -Rules $dirRules
+            Write-Log SUCCESS "ACL dossier OK : $chromeAppDir"
 
-            # ACL exe : lecture seule pour Users (pas d'exécution)
+            # ACL sur chaque .exe (bloquer exécution pour Users)
             foreach ($exe in (Get-ChildItem (Split-Path $chromeExe -Parent) -Filter '*.exe' -ErrorAction SilentlyContinue)) {
-                $exeAcl = Get-Acl -LiteralPath $exe.FullName
-                $exeAcl.SetOwner($adminAccount)
-                $exeAcl.SetAccessRuleProtection($true, $false)
-                $exeAcl.Access | ForEach-Object { $exeAcl.RemoveAccessRule($_) | Out-Null }
-                $exeAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($AdminGroup, 'FullControl', 'None', 'None', 'Allow')))
-                $exeAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('SYSTEM', 'FullControl', 'None', 'None', 'Allow')))
-                $exeAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($UsersGroup, 'Read', 'None', 'None', 'Allow')))
-                Set-Acl -LiteralPath $exe.FullName -AclObject $exeAcl
+                Set-AclSafe -Path $exe.FullName -Owner $adminAccount -Rules $exeRules
                 Write-Log SUCCESS "ACL exe bloqué : $($exe.Name)"
             }
         }
@@ -174,7 +227,7 @@ public class TokenPriv {
         }
     }
 
-    # SRP (Software Restriction Policy)
+    # SRP (Software Restriction Policy) - bloque l'exécution pour les non-admins
     $srpBase = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers'
     try {
         if (-not (Test-Path $srpBase)) { New-Item -Path $srpBase -Force | Out-Null }
