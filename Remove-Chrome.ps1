@@ -358,17 +358,17 @@ function Invoke-ChromeTaskbarAutoRepair {
     else {
         Write-Log 'SUCCESS' "$totalRemoved raccourci(s) Chrome résiduel(s) supprimé(s)."
     }
-    # 2. Tenter un désépinglage immédiat via Register-ScheduledTask (cmdlet PS, pas schtasks.exe)
-    $immediateOk = $false
-    try {
-        $computerSystem = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
-        $interactiveUser = $computerSystem.UserName
-        if ($interactiveUser) {
-            $userNameOnly = $interactiveUser.Split('\')[-1]
-            $userProfile = $profiles | Where-Object { $_.LocalPath -match [regex]::Escape($userNameOnly) } | Select-Object -First 1
-            if ($userProfile) {
-                $vbsPath = Join-Path $userProfile.LocalPath 'AppData\Local\Temp\UnpinChrome.vbs'
-                $vbsContent = @"
+    # 2. Enregistrer RunOnce pour désépingler proprement au prochain logon (pas de tâche planifiée)
+    foreach ($profile in $profiles) {
+        if (-not $profile.Loaded) { continue }
+        $sid = $profile.SID
+        $runOncePath = "Registry::HKU\$sid\Software\Microsoft\Windows\CurrentVersion\RunOnce"
+        try {
+            if (-not (Test-Path $runOncePath)) {
+                New-Item -Path $runOncePath -Force -ErrorAction Stop | Out-Null
+            }
+            $vbsPath = Join-Path $profile.LocalPath 'AppData\Local\Temp\UnpinChrome.vbs'
+            $vbsContent = @"
 Set sh = CreateObject(""Shell.Application"")
 Set wsh = CreateObject(""WScript.Shell"")
 tb = wsh.ExpandEnvironmentStrings(""%APPDATA%"") & ""\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar""
@@ -390,64 +390,12 @@ If fso.FolderExists(tb) Then
 End If
 fso.DeleteFile WScript.ScriptFullName, True
 "@
-                Set-Content -Path $vbsPath -Value $vbsContent -Encoding ASCII -Force
-                $taskName = 'UnpinChromeImmediate'
-                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-                $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$vbsPath`""
-                $principal = New-ScheduledTaskPrincipal -UserId $interactiveUser -LogonType Interactive -RunLevel Limited
-                $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-                Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
-                Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
-                Write-Log 'SUCCESS' "Désépinglage immédiat lancé dans la session de $interactiveUser"
-                $immediateOk = $true
-                Start-Sleep -Seconds 3
-                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-            }
+            Set-Content -Path $vbsPath -Value $vbsContent -Encoding ASCII -Force
+            Set-ItemProperty -Path $runOncePath -Name 'UnpinChrome' -Value "wscript.exe `"$vbsPath`"" -Type String -ErrorAction Stop
+            Write-Log 'SUCCESS' "RunOnce enregistré pour $($profile.LocalPath) : l''icône Chrome sera supprimée au prochain logon"
         }
-    }
-    catch {
-        Write-Log 'WARNING' "Désépinglage immédiat impossible : $($_.Exception.Message)"
-    }
-    # 3. Fallback : enregistrer RunOnce pour le prochain logon
-    if (-not $immediateOk) {
-        foreach ($profile in $profiles) {
-            if (-not $profile.Loaded) { continue }
-            $sid = $profile.SID
-            $runOncePath = "Registry::HKU\$sid\Software\Microsoft\Windows\CurrentVersion\RunOnce"
-            try {
-                if (-not (Test-Path $runOncePath)) {
-                    New-Item -Path $runOncePath -Force -ErrorAction Stop | Out-Null
-                }
-                $vbsPath = Join-Path $profile.LocalPath 'AppData\Local\Temp\UnpinChrome.vbs'
-                $vbsContent = @"
-Set sh = CreateObject(""Shell.Application"")
-Set wsh = CreateObject(""WScript.Shell"")
-tb = wsh.ExpandEnvironmentStrings(""%APPDATA%"") & ""\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar""
-Set fso = CreateObject(""Scripting.FileSystemObject"")
-If fso.FolderExists(tb) Then
-    Set folder = sh.Namespace(tb)
-    If Not folder Is Nothing Then
-        For Each item In folder.Items
-            nm = LCase(item.Name)
-            If InStr(nm, ""chrome"") > 0 Then
-                For Each verb In item.Verbs
-                    If InStr(verb.Name, ""pingler"") > 0 Or InStr(verb.Name, ""Unpin"") > 0 Then
-                        verb.DoIt
-                    End If
-                Next
-            End If
-        Next
-    End If
-End If
-fso.DeleteFile WScript.ScriptFullName, True
-"@
-                Set-Content -Path $vbsPath -Value $vbsContent -Encoding ASCII -Force
-                Set-ItemProperty -Path $runOncePath -Name 'UnpinChrome' -Value "wscript.exe `"$vbsPath`"" -Type String -ErrorAction Stop
-                Write-Log 'SUCCESS' "RunOnce enregistré : l''icône Chrome sera supprimée au prochain logon (SID: $sid)"
-            }
-            catch {
-                Write-Log 'WARNING' "Impossible d''enregistrer RunOnce pour SID $sid : $($_.Exception.Message)"
-            }
+        catch {
+            Write-Log 'WARNING' "Impossible d''enregistrer RunOnce pour SID $sid : $($_.Exception.Message)"
         }
     }
 }
