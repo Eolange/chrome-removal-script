@@ -138,7 +138,7 @@ foreach ($dir in "${env:ProgramFiles(x86)}\Google\Update", "${env:ProgramFiles}\
 }
 #endregion
 
-#region 5. Bloquer chrome.exe par ACL (icacls) + SRP
+#region 5. Bloquer chrome.exe par ACL (icacls)
 $chromePaths = @(
     "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
     "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe"
@@ -147,87 +147,56 @@ $chromePaths = @(
 if (-not $chromePaths) {
     Write-Log INFO "Chrome n'est pas installé sur ce poste."
 } else {
+    # Nettoyer les anciennes règles SRP qui peuvent bloquer tout le monde
+    $srpCleanup = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers\0\Paths'
+    if (Test-Path $srpCleanup) {
+        Get-ChildItem $srpCleanup -ErrorAction SilentlyContinue | ForEach-Object {
+            $itemData = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).ItemData
+            if ($itemData -match 'chrome\.exe') {
+                Remove-Item $_.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Log SUCCESS "Ancienne règle SRP supprimée : $itemData"
+            }
+        }
+    }
+
     foreach ($chromeExe in $chromePaths) {
         $chromeDir = Split-Path $chromeExe -Parent
+        $chromeAppDir = Split-Path $chromeDir -Parent
         Write-Log INFO "Blocage de : $chromeExe"
 
-        # D'abord : réparer le dossier parent si un ancien script a cassé ses ACL
-        $chromeAppDir = Split-Path $chromeDir -Parent
-        Write-Log INFO "Réparation ACL dossier : $chromeAppDir"
-        & takeown /F $chromeAppDir /A /R /D O 2>$null | Out-Null
-        & icacls $chromeAppDir /reset /T /Q 2>$null | Out-Null
-        Write-Log SUCCESS "ACL dossier réinitialisé (héritage normal) : $chromeAppDir"
+        # 1. Reprendre possession de tout (répare les dégâts des exécutions précédentes)
+        Write-Log INFO "  takeown sur $chromeAppDir..."
+        & takeown /F $chromeAppDir /A /R /D O 2>&1 | Out-Null
 
-        # Bloquer chaque .exe : propriété admin + Users en Read seul (pas d'exécution)
-        # On utilise les SIDs pour éviter les problèmes de langue (FR/EN)
-        # S-1-5-32-544 = Administrators/Administrateurs
-        # S-1-5-18     = SYSTEM
-        # S-1-5-32-545 = Users/Utilisateurs
+        # 2. Réinitialiser TOUTES les ACL (héritage normal restauré)
+        Write-Log INFO "  Reset ACL sur $chromeAppDir..."
+        & icacls $chromeAppDir /reset /T /Q 2>&1 | Out-Null
+        Write-Log SUCCESS "  Dossier restauré en permissions normales."
+
+        # 3. Sur chaque .exe : ajouter un Deny Execute pour le groupe Users
+        #    Le Deny est prioritaire sur les Allow hérités.
+        #    Les admins ne sont PAS affectés car on ajoute aussi un Allow explicite pour eux.
         $exeFiles = Get-ChildItem -LiteralPath $chromeDir -Filter '*.exe' -ErrorAction SilentlyContinue
         foreach ($exe in $exeFiles) {
             $exePath = $exe.FullName
             Write-Log INFO "  Traitement : $($exe.Name)"
 
-            # 1. Prendre possession pour Administrators
-            $r = & takeown /F $exePath /A 2>&1
-            Write-Log INFO "    takeown: $r"
+            # a) S'assurer que les admins ont un Allow FullControl explicite
+            #    (un Allow explicite pour Admins + un Deny pour Users = admins passent, users bloqués)
+            $r = & icacls $exePath /grant 'BUILTIN\Administrators:(F)' 2>&1
+            Write-Log INFO "    grant Admins: $($r | Select-Object -First 1)"
+            $r = & icacls $exePath /grant 'NT AUTHORITY\SYSTEM:(F)' 2>&1
+            Write-Log INFO "    grant SYSTEM: $($r | Select-Object -First 1)"
 
-            # 2. AVANT de couper l'héritage : donner FullControl aux admins et SYSTEM
-            #    (sinon après /inheritance:r plus personne n'a accès et les /grant échouent)
-            $r = & icacls $exePath /grant "*S-1-5-32-544:(F)" 2>&1
-            Write-Log INFO "    grant Admins: $r"
-            $r = & icacls $exePath /grant "*S-1-5-18:(F)" 2>&1
-            Write-Log INFO "    grant SYSTEM: $r"
+            # b) Ajouter Deny Execute pour Users (bloque l'exécution, pas la lecture)
+            $r = & icacls $exePath /deny 'BUILTIN\Users:(X)' 2>&1
+            Write-Log INFO "    deny Users(X): $($r | Select-Object -First 1)"
 
-            # 3. Maintenant couper l'héritage (les grants explicites ci-dessus survivent)
-            $r = & icacls $exePath /inheritance:r 2>&1
-            Write-Log INFO "    inheritance:r: $r"
-
-            # 4. Users : Read seul (R = lire, PAS RX = lire+exécuter)
-            $r = & icacls $exePath /grant "*S-1-5-32-545:(R)" 2>&1
-            Write-Log INFO "    grant Users(R): $r"
-
-            # 5. Vérifier le résultat
+            # c) Vérifier
             $check = & icacls $exePath
             Write-Log INFO "    Permissions finales :"
-            $check | ForEach-Object { if ($_ -match 'S-1-5|BUILTIN|NT AUTHORITY|Admini|Users|Utilisat') { Write-Log INFO "      $_" } }
-
-            $hasAdmin = $check -match 'S-1-5-32-544'
-            $hasSystem = $check -match 'S-1-5-18'
-            if ($hasAdmin -and $hasSystem) {
-                Write-Log SUCCESS "ACL OK : $($exe.Name)"
-            } else {
-                Write-Log ERROR "ACL ECHOUE sur $($exe.Name) — vérifier manuellement avec: icacls `"$exePath`""
-            }
+            $check | ForEach-Object { if ($_.Trim()) { Write-Log INFO "      $_" } }
         }
-    }
-
-    # SRP (Software Restriction Policy) - bloque l'exécution pour les non-admins
-    $srpBase = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers'
-    try {
-        if (-not (Test-Path $srpBase)) { New-Item -Path $srpBase -Force | Out-Null }
-        $current = Get-ItemProperty -Path $srpBase -ErrorAction SilentlyContinue
-        if ($null -eq $current.DefaultLevel) { Set-ItemProperty $srpBase -Name 'DefaultLevel' -Value 262144 -Type DWord }
-        Set-ItemProperty $srpBase -Name 'PolicyScope' -Value 1 -Type DWord
-
-        $pathsBase = "$srpBase\0\Paths"
-        if (-not (Test-Path $pathsBase)) { New-Item -Path $pathsBase -Force | Out-Null }
-
-        $rules = @(
-            @{ Guid='{B4A2D3A1-5C6D-4E8F-9A0B-1C2D3E4F5A6B}'; Path="${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe" },
-            @{ Guid='{B4A2D3A1-5C6D-4E8F-9A0B-1C2D3E4F5A6C}'; Path="${env:ProgramFiles}\Google\Chrome\Application\chrome.exe" }
-        )
-        foreach ($rule in $rules) {
-            if (-not $rule.Path) { continue }
-            $rp = Join-Path $pathsBase $rule.Guid
-            New-Item -Path $rp -Force | Out-Null
-            Set-ItemProperty $rp -Name 'ItemData' -Value $rule.Path -Type String
-            Set-ItemProperty $rp -Name 'SaferFlags' -Value 0 -Type DWord
-            Write-Log SUCCESS "SRP bloqué : $($rule.Path)"
-        }
-    }
-    catch {
-        Write-Log ERROR "Configuration SRP échouée : $($_.Exception.Message)"
     }
 }
 #endregion
