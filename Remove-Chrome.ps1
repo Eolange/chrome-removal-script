@@ -198,8 +198,13 @@ if (-not $chromePaths) {
             $r = & icacls $exePath /inheritance:r 2>&1
             Write-Log INFO "    inheritance:r: $($r | Select-Object -First 1)"
 
-            # d) PAS de grant pour Users = les users n'ont AUCUN droit sur le .exe
-            #    Seuls Admins et SYSTEM peuvent y accéder
+            # d) Donner Read seul (PAS Execute) aux Users
+            #    Nécessaire pour que Windows puisse lire le .exe (manifeste, prompt UAC)
+            #    sinon même "Exécuter en tant qu'admin" échoue car Windows ne peut pas
+            #    inspecter le fichier avant l'élévation.
+            #    Read (R) ≠ ReadAndExecute (RX) : R ne permet PAS de lancer le programme.
+            $r = & icacls $exePath /grant '*S-1-5-32-545:(R)' 2>&1
+            Write-Log INFO "    grant Users(R): $($r | Select-Object -First 1)"
 
             # e) Vérifier
             $check = & icacls $exePath
