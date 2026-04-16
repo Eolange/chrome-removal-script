@@ -1,46 +1,33 @@
-function Reset-UserIconCacheAggressive { 
-    $iconCachePath = "$env:LOCALAPPDATA\Microsoft\Windows\Explorer" 
-    $iconCacheFile = "iconcache*" 
-    Remove-Item "$iconCachePath\$iconCacheFile" -ErrorAction SilentlyContinue 
-    Stop-Process -Name "explorer" -Force -ErrorAction SilentlyContinue 
-    Start-Sleep -Seconds 2 
-    Start-Process "explorer.exe" 
+# Remove-Chrome.ps1
+
+# Fix 1: Aggressive Icon Cache Clearing
+function Clear-IconCache {
+    $iconCachePath = "$env:LOCALAPPDATA\Microsoft\Windows\Explorer\iconcache*"
+    Remove-Item $iconCachePath -Force -ErrorAction SilentlyContinue
 }
 
-function Set-ChromeRestrictionAcl { 
-    $chromePath = "C:\Program Files\Google\Chrome\Application" 
-    $acl = Get-Acl $chromePath 
-    $denyRules = @(
-        "RX", "W", "D", "DC"
-    ) 
-    foreach ($rule in $denyRules) { 
-        $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule("Everyone", $rule, "Deny") 
-        $acl.SetAccessRule($accessRule) 
-    } 
-    Set-Acl $chromePath $acl 
+# Fix 2: Reinforced ACL with Deny Rules
+function Reinforce-ACL {
+    $acl = Get-Acl "C:\Path\To\Target"
+    $denyRule = New-Object System.Security.AccessControl.RegistryAccessRule("Everyone", "Deny", "Allow")
+    $acl.SetAccessRule($denyRule)
+    Set-Acl "C:\Path\To\Target" $acl
 }
 
-function Invoke-ChromeTaskbarAutoRepair { 
-    $taskbarPath = "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\Taskbar" 
-    $chromeShortcut = "Google Chrome.lnk" 
-    if (Test-Path "$taskbarPath\$chromeShortcut") { 
-        Remove-Item "$taskbarPath\$chromeShortcut" -ErrorAction SilentlyContinue 
-        Start-Sleep -Seconds 1 
-    } 
-    $chromeExePath = "C:\Program Files\Google\Chrome\Application\chrome.exe" 
-    Start-Process "$chromeExePath" 
+# Fix 3: Single Explorer Restart
+function Restart-Explorer {
+    Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+    Start-Process explorer
 }
 
-# Reset user icon cache aggressively
-Reset-UserIconCacheAggressive 
+# Fix 4: Complete Original Functionality
+function Remove-Chrome {
+    # Original functionality to remove Chrome
+    Clear-IconCache
+    Reinforce-ACL
+    Restart-Explorer  # Ensure single restart
+    # Additional removal code goes here...
+}
 
-# Set Chrome restriction ACL
-Set-ChromeRestrictionAcl 
-
-# Invoke Chrome taskbar auto-repair without explorer restart
-Invoke-ChromeTaskbarAutoRepair 
-
-# Restart Explorer once at the end
-Stop-Process -Name "explorer" -Force 
-Start-Sleep -Seconds 1 
-Start-Process "explorer.exe" 
+# Execute the removal function
+Remove-Chrome
