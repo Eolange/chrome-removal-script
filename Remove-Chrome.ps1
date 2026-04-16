@@ -319,15 +319,14 @@ function Reset-UserIconCache {
 }
 
 function Invoke-ChromeTaskbarAutoRepair {
-    # Nettoyage complémentaire : supprimer tout raccourci Chrome résiduel dans les profils
     $profiles = Get-ActiveUserProfiles
     $wshShell = $null
     try { $wshShell = New-Object -ComObject WScript.Shell } catch {}
     $totalRemoved = 0
+    # 1. Supprimer tous les raccourcis Chrome résiduels
     foreach ($profile in $profiles) {
         $quickLaunchRoot = Join-Path $profile.LocalPath 'AppData\Roaming\Microsoft\Internet Explorer\Quick Launch'
         if (-not (Test-Path -LiteralPath $quickLaunchRoot)) { continue }
-        # Rechercher récursivement tous les .lnk Chrome dans Quick Launch
         try {
             $allLinks = Get-ChildItem -LiteralPath $quickLaunchRoot -Filter '*.lnk' -Recurse -Force -ErrorAction SilentlyContinue
             foreach ($lnk in $allLinks) {
@@ -359,6 +358,35 @@ function Invoke-ChromeTaskbarAutoRepair {
     else {
         Write-Log 'SUCCESS' "$totalRemoved raccourci(s) Chrome résiduel(s) supprimé(s)."
     }
+    # 2. Arrêter explorer pour libérer les fichiers cache
+    $explorerProcs = Get-Process explorer -ErrorAction SilentlyContinue
+    if ($explorerProcs) {
+        $explorerProcs | Stop-Process -Force -ErrorAction SilentlyContinue
+        Write-Log 'INFO' 'Explorer arrêté pour nettoyage du cache.'
+        Start-Sleep -Seconds 2
+    }
+    # 3. Nettoyer le cache d'icônes de chaque profil (fichiers déverrouillés car explorer est arrêté)
+    foreach ($profile in $profiles) {
+        $explorerCacheDir = Join-Path $profile.LocalPath 'AppData\Local\Microsoft\Windows\Explorer'
+        $iconDb = Join-Path $profile.LocalPath 'AppData\Local\IconCache.db'
+        try {
+            if (Test-Path -LiteralPath $explorerCacheDir) {
+                Get-ChildItem -LiteralPath $explorerCacheDir -Filter 'iconcache_*' -Force -ErrorAction SilentlyContinue |
+                    Remove-Item -Force -ErrorAction SilentlyContinue
+                Write-Log 'SUCCESS' "Cache icônes supprimé : $explorerCacheDir"
+            }
+            if (Test-Path -LiteralPath $iconDb) {
+                Remove-Item -LiteralPath $iconDb -Force -ErrorAction SilentlyContinue
+                Write-Log 'SUCCESS' "IconCache.db supprimé : $iconDb"
+            }
+        }
+        catch {
+            Write-Log 'WARNING' "Nettoyage cache impossible pour $($profile.LocalPath) : $($_.Exception.Message)"
+        }
+    }
+    # 4. Relancer explorer
+    Start-Process explorer.exe -ErrorAction SilentlyContinue
+    Write-Log 'INFO' 'Explorer relancé après nettoyage du cache.'
 }
 
 function Set-ChromeRestrictionAcl {
@@ -369,8 +397,9 @@ function Set-ChromeRestrictionAcl {
     $chromeDir = Split-Path -Path $ChromeExePath -Parent
     $chromeAppDir = Split-Path -Path $chromeDir -Parent
     $adminGroup = if (Test-IdentityResolvable -Identity 'Administrateurs') { 'Administrateurs' } else { 'Administrators' }
-    Write-Log 'INFO' "Blocage ACL Chrome : $chromeAppDir"
-    Write-Log 'INFO' "Groupe admin détecté : $adminGroup"
+    $usersGroup = if (Test-IdentityResolvable -Identity 'Utilisateurs') { 'Utilisateurs' } else { 'Users' }
+    Write-Log 'INFO' "Blocage ACL Chrome : chrome.exe uniquement (dossier reste lisible)"
+    Write-Log 'INFO' "Groupe admin détecté : $adminGroup / Groupe users : $usersGroup"
     # Activer le privilège SeTakeOwnershipPrivilege pour pouvoir changer le propriétaire
     $tokenPriv = @'
 using System;
@@ -403,12 +432,10 @@ public class TokenPriv {
     }
     try {
         $adminAccount = New-Object System.Security.Principal.NTAccount($adminGroup)
-        # Prendre possession du dossier racine
+        # --- DOSSIER : lisible par tout le monde, modifiable par admins ---
         $acl = Get-Acl -LiteralPath $chromeAppDir
         $acl.SetOwner($adminAccount)
         Set-Acl -LiteralPath $chromeAppDir -AclObject $acl -ErrorAction Stop
-        Write-Log 'SUCCESS' "Propriétaire changé sur $chromeAppDir"
-        # Appliquer les ACL sur le dossier racine
         $acl = Get-Acl -LiteralPath $chromeAppDir
         $acl.SetAccessRuleProtection($true, $false)
         $acl.Access | ForEach-Object { $acl.RemoveAccessRule($_) | Out-Null }
@@ -416,56 +443,59 @@ public class TokenPriv {
             $adminGroup, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
         $systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
             'SYSTEM', 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+        $usersRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $usersGroup, 'ReadAndExecute,ListDirectory', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
         $acl.AddAccessRule($adminRule)
         $acl.AddAccessRule($systemRule)
+        $acl.AddAccessRule($usersRule)
         Set-Acl -LiteralPath $chromeAppDir -AclObject $acl -ErrorAction Stop
-        Write-Log 'SUCCESS' "ACL appliquée sur $chromeAppDir (racine)"
-        # Appliquer récursivement
-        $errors = 0
-        $items = @(Get-ChildItem -LiteralPath $chromeAppDir -Recurse -Force -ErrorAction SilentlyContinue)
-        Write-Log 'INFO' "Application récursive des ACL sur $($items.Count) éléments..."
-        foreach ($item in $items) {
-            try {
-                $itemAcl = Get-Acl -LiteralPath $item.FullName
-                $itemAcl.SetOwner($adminAccount)
-                Set-Acl -LiteralPath $item.FullName -AclObject $itemAcl -ErrorAction Stop
-                $itemAcl = Get-Acl -LiteralPath $item.FullName
-                $itemAcl.SetAccessRuleProtection($true, $false)
-                foreach ($rule in @($itemAcl.Access)) { $itemAcl.RemoveAccessRule($rule) | Out-Null }
-                if ($item.PSIsContainer) {
-                    $itemAcl.AddAccessRule($adminRule)
-                    $itemAcl.AddAccessRule($systemRule)
+        Write-Log 'SUCCESS' "ACL dossier appliquée sur $chromeAppDir ($adminGroup + SYSTEM + $usersGroup en lecture)"
+        # --- CHROME.EXE : bloquer l'exécution pour les non-admins ---
+        $exeAcl = Get-Acl -LiteralPath $ChromeExePath
+        $exeAcl.SetOwner($adminAccount)
+        Set-Acl -LiteralPath $ChromeExePath -AclObject $exeAcl -ErrorAction Stop
+        $exeAcl = Get-Acl -LiteralPath $ChromeExePath
+        $exeAcl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($exeAcl.Access)) { $exeAcl.RemoveAccessRule($rule) | Out-Null }
+        $exeAdminRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $adminGroup, 'FullControl', 'None', 'None', 'Allow')
+        $exeSystemRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            'SYSTEM', 'FullControl', 'None', 'None', 'Allow')
+        $exeAcl.AddAccessRule($exeAdminRule)
+        $exeAcl.AddAccessRule($exeSystemRule)
+        Set-Acl -LiteralPath $ChromeExePath -AclObject $exeAcl -ErrorAction Stop
+        Write-Log 'SUCCESS' "ACL chrome.exe : seuls $adminGroup + SYSTEM peuvent exécuter"
+        # Bloquer aussi new_chrome.exe et chrome_proxy.exe s'ils existent
+        $otherExes = @('new_chrome.exe', 'chrome_proxy.exe')
+        foreach ($exeName in $otherExes) {
+            $otherExePath = Join-Path $chromeDir $exeName
+            if (Test-Path -LiteralPath $otherExePath) {
+                try {
+                    $otherAcl = Get-Acl -LiteralPath $otherExePath
+                    $otherAcl.SetOwner($adminAccount)
+                    Set-Acl -LiteralPath $otherExePath -AclObject $otherAcl -ErrorAction Stop
+                    $otherAcl = Get-Acl -LiteralPath $otherExePath
+                    $otherAcl.SetAccessRuleProtection($true, $false)
+                    foreach ($rule in @($otherAcl.Access)) { $otherAcl.RemoveAccessRule($rule) | Out-Null }
+                    $otherAcl.AddAccessRule($exeAdminRule)
+                    $otherAcl.AddAccessRule($exeSystemRule)
+                    Set-Acl -LiteralPath $otherExePath -AclObject $otherAcl -ErrorAction Stop
+                    Write-Log 'SUCCESS' "ACL bloquée sur $exeName"
                 }
-                else {
-                    $fileAdminRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-                        $adminGroup, 'FullControl', 'None', 'None', 'Allow')
-                    $fileSystemRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-                        'SYSTEM', 'FullControl', 'None', 'None', 'Allow')
-                    $itemAcl.AddAccessRule($fileAdminRule)
-                    $itemAcl.AddAccessRule($fileSystemRule)
+                catch {
+                    Write-Log 'WARNING' "ACL non appliquée sur $otherExePath : $($_.Exception.Message)"
                 }
-                Set-Acl -LiteralPath $item.FullName -AclObject $itemAcl -ErrorAction Stop
-            }
-            catch {
-                $errors++
-                Write-Log 'WARNING' "ACL non appliquée sur $($item.FullName) : $($_.Exception.Message)"
             }
         }
-        if ($errors -eq 0) {
-            Write-Log 'SUCCESS' "ACL appliquée récursivement sur $chromeAppDir : seuls $adminGroup + SYSTEM ont accès"
-        }
-        else {
-            Write-Log 'WARNING' "ACL appliquée avec $errors erreurs sur $chromeAppDir"
-        }
-        # Vérification
-        $testAcl = Get-Acl -LiteralPath $chromeAppDir
+        # Vérification sur chrome.exe
+        $testAcl = Get-Acl -LiteralPath $ChromeExePath
         $nonAdmin = $testAcl.Access | Where-Object { $_.IdentityReference -notmatch "SYSTEM|Syst.me|AUTORITE|$([regex]::Escape($adminGroup))|BUILTIN" }
         if ($nonAdmin) {
-            Write-Log 'WARNING' "ACL vérification : des permissions non-admin subsistent sur $chromeAppDir"
+            Write-Log 'WARNING' "ACL vérification chrome.exe : des permissions non-admin subsistent"
             $nonAdmin | ForEach-Object { Write-Log 'WARNING' "  -> $($_.IdentityReference) : $($_.FileSystemRights)" }
         }
         else {
-            Write-Log 'SUCCESS' "ACL vérification OK : seuls $adminGroup + SYSTEM ont accès à $chromeAppDir"
+            Write-Log 'SUCCESS' "ACL vérification OK : chrome.exe accessible uniquement par $adminGroup + SYSTEM"
         }
     }
     catch {
