@@ -148,13 +148,23 @@ function Disable-GoogleTasks {
         if (Test-Path -LiteralPath $updateDir) {
             Remove-ItemSafe -Path $updateDir | Out-Null
         }
+        else {
+            Write-Log 'INFO' "Dossier Google Update introuvable : $updateDir"
+        }
     }
 }
 
 function Stop-ChromeProcesses {
     try {
-        Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-        Write-Log 'INFO' 'Processus Chrome arrêtés.'
+        $procs = Get-Process chrome -ErrorAction SilentlyContinue
+        if ($procs) {
+            $count = @($procs).Count
+            $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+            Write-Log 'SUCCESS' "$count processus Chrome arrêtés."
+        }
+        else {
+            Write-Log 'INFO' 'Aucun processus Chrome en cours.'
+        }
     }
     catch {
         Write-Log 'WARNING' "Impossible d''arrêter Chrome : $($_.Exception.Message)"
@@ -221,6 +231,7 @@ function Remove-ChromeTaskbarPins {
         Write-Log 'WARNING' "Impossible d''initialiser WScript.Shell : $($_.Exception.Message)"
     }
     foreach ($profile in $profiles) {
+        Write-Log 'INFO' "Traitement taskbar pour : $($profile.LocalPath)"
         $taskbarDir = Join-Path $profile.LocalPath 'AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar'
         try {
             if (-not (Test-Path -LiteralPath $taskbarDir)) {
@@ -307,16 +318,22 @@ function Reset-UserIconCache {
 
 function Invoke-ChromeTaskbarAutoRepair {
     $profiles = Get-ActiveUserProfiles
-    Write-Log 'INFO' 'Arrêt de l''explorateur pour nettoyage du cache d''icônes.'
-    Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
+    Write-Log 'INFO' 'Arrêt de l''explorateur et des processus Shell pour nettoyage.'
+    foreach ($procName in @('explorer', 'ShellExperienceHost', 'SearchHost', 'SearchApp', 'StartMenuExperienceHost')) {
+        $proc = Get-Process $procName -ErrorAction SilentlyContinue
+        if ($proc) {
+            $proc | Stop-Process -Force -ErrorAction SilentlyContinue
+            Write-Log 'INFO' "Processus arrêté : $procName"
+        }
+    }
+    Start-Sleep -Seconds 3
     foreach ($profile in $profiles) {
         if ($profile.Loaded -or (Test-Path -LiteralPath $profile.LocalPath)) {
             Reset-UserIconCache -UserProfilePath $profile.LocalPath
         }
     }
     Start-Process explorer.exe -ErrorAction SilentlyContinue
-    Write-Log 'INFO' 'Explorateur redémarré après nettoyage du cache d''icônes.'
+    Write-Log 'INFO' 'Explorateur redémarré après nettoyage complet.'
 }
 
 function Set-ChromeRestrictionAcl {
@@ -327,15 +344,94 @@ function Set-ChromeRestrictionAcl {
     $chromeDir = Split-Path -Path $ChromeExePath -Parent
     $chromeAppDir = Split-Path -Path $chromeDir -Parent
     $adminGroup = if (Test-IdentityResolvable -Identity 'Administrateurs') { 'Administrateurs' } else { 'Administrators' }
-    $takeownAnswer = if ((Get-Culture).TwoLetterISOLanguageName -eq 'fr') { 'O' } else { 'Y' }
     Write-Log 'INFO' "Blocage ACL Chrome : $chromeAppDir"
+    Write-Log 'INFO' "Groupe admin détecté : $adminGroup"
+    # Activer le privilège SeTakeOwnershipPrivilege pour pouvoir changer le propriétaire
+    $tokenPriv = @'
+using System;
+using System.Runtime.InteropServices;
+public class TokenPriv {
+    [DllImport("advapi32.dll", SetLastError=true)]
+    static extern bool AdjustTokenPrivileges(IntPtr h, bool d, ref TOKEN_PRIVILEGES n, int l, IntPtr p, IntPtr r);
+    [DllImport("advapi32.dll", SetLastError=true)]
+    static extern bool OpenProcessToken(IntPtr h, uint a, out IntPtr t);
+    [DllImport("advapi32.dll", SetLastError=true)]
+    static extern bool LookupPrivilegeValue(string s, string n, out long l);
+    struct TOKEN_PRIVILEGES { public int Count; public long Luid; public int Attr; }
+    public static void Enable(string priv) {
+        IntPtr token; long luid;
+        OpenProcessToken((IntPtr)(-1), 0x28, out token);
+        LookupPrivilegeValue(null, priv, out luid);
+        TOKEN_PRIVILEGES tp = new TOKEN_PRIVILEGES { Count = 1, Luid = luid, Attr = 2 };
+        AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+    }
+}
+'@
+    try { Add-Type $tokenPriv -ErrorAction SilentlyContinue } catch {}
     try {
-        & takeown.exe /F "$chromeAppDir" /A 2>&1 | Out-Null
-        & icacls.exe "$chromeAppDir" /grant "$adminGroup`:F" /C /Q 2>&1 | Out-Null
-        & takeown.exe /F "$chromeAppDir" /R /A /D $takeownAnswer 2>&1 | Out-Null
-        & icacls.exe "$chromeAppDir" /inheritance:r /T /C /Q 2>&1 | Out-Null
-        & icacls.exe "$chromeAppDir" /grant:r "$adminGroup`:(OI)(CI)F" /grant:r "SYSTEM:(OI)(CI)F" /T /C /Q 2>&1 | Out-Null
-        Write-Log 'SUCCESS' "ACL appliquée sur $chromeAppDir : seuls admins + SYSTEM ont accès (dossier et contenu)"
+        [TokenPriv]::Enable('SeTakeOwnershipPrivilege')
+        [TokenPriv]::Enable('SeRestorePrivilege')
+        Write-Log 'INFO' 'Privilèges SeTakeOwnership et SeRestore activés.'
+    }
+    catch {
+        Write-Log 'WARNING' "Impossible d''activer les privilèges : $($_.Exception.Message)"
+    }
+    try {
+        $adminAccount = New-Object System.Security.Principal.NTAccount($adminGroup)
+        # Prendre possession du dossier racine
+        $acl = Get-Acl -LiteralPath $chromeAppDir
+        $acl.SetOwner($adminAccount)
+        Set-Acl -LiteralPath $chromeAppDir -AclObject $acl -ErrorAction Stop
+        Write-Log 'SUCCESS' "Propriétaire changé sur $chromeAppDir"
+        # Appliquer les ACL sur le dossier racine
+        $acl = Get-Acl -LiteralPath $chromeAppDir
+        $acl.SetAccessRuleProtection($true, $false)
+        $acl.Access | ForEach-Object { $acl.RemoveAccessRule($_) | Out-Null }
+        $adminRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $adminGroup, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+        $systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            'SYSTEM', 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+        $acl.AddAccessRule($adminRule)
+        $acl.AddAccessRule($systemRule)
+        Set-Acl -LiteralPath $chromeAppDir -AclObject $acl -ErrorAction Stop
+        Write-Log 'SUCCESS' "ACL appliquée sur $chromeAppDir (racine)"
+        # Appliquer récursivement
+        $errors = 0
+        $items = @(Get-ChildItem -LiteralPath $chromeAppDir -Recurse -Force -ErrorAction SilentlyContinue)
+        Write-Log 'INFO' "Application récursive des ACL sur $($items.Count) éléments..."
+        $items | ForEach-Object {
+            try {
+                $itemAcl = Get-Acl -LiteralPath $_.FullName
+                $itemAcl.SetOwner($adminAccount)
+                Set-Acl -LiteralPath $_.FullName -AclObject $itemAcl -ErrorAction Stop
+                $itemAcl = Get-Acl -LiteralPath $_.FullName
+                $itemAcl.SetAccessRuleProtection($true, $false)
+                $itemAcl.Access | ForEach-Object { $itemAcl.RemoveAccessRule($_) | Out-Null }
+                $itemAcl.AddAccessRule($adminRule)
+                $itemAcl.AddAccessRule($systemRule)
+                Set-Acl -LiteralPath $_.FullName -AclObject $itemAcl -ErrorAction Stop
+            }
+            catch {
+                $errors++
+                Write-Log 'WARNING' "ACL non appliquée sur $($_.FullName) : $($_.Exception.Message)"
+            }
+        }
+        if ($errors -eq 0) {
+            Write-Log 'SUCCESS' "ACL appliquée récursivement sur $chromeAppDir : seuls $adminGroup + SYSTEM ont accès"
+        }
+        else {
+            Write-Log 'WARNING' "ACL appliquée avec $errors erreurs sur $chromeAppDir"
+        }
+        # Vérification
+        $testAcl = Get-Acl -LiteralPath $chromeAppDir
+        $nonAdmin = $testAcl.Access | Where-Object { $_.IdentityReference -notmatch "SYSTEM|$([regex]::Escape($adminGroup))|BUILTIN" }
+        if ($nonAdmin) {
+            Write-Log 'WARNING' "ACL vérification : des permissions non-admin subsistent sur $chromeAppDir"
+            $nonAdmin | ForEach-Object { Write-Log 'WARNING' "  -> $($_.IdentityReference) : $($_.FileSystemRights)" }
+        }
+        else {
+            Write-Log 'SUCCESS' "ACL vérification OK : seuls $adminGroup + SYSTEM ont accès à $chromeAppDir"
+        }
     }
     catch {
         Write-Log 'ERROR' "Blocage ACL Chrome échoué : $($_.Exception.Message)"
@@ -372,6 +468,7 @@ Disable-GoogleTasks
 Remove-ChromeTaskbarPins
 $chromeExe = Get-ChromeExePath
 if ($chromeExe) {
+    Write-Log 'INFO' "Chrome trouvé : $chromeExe"
     Set-ChromeRestrictionAcl -ChromeExePath $chromeExe
 } else {
     Write-Log 'INFO' "Chrome n''est pas installé sur ce poste."
