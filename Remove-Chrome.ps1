@@ -317,23 +317,67 @@ function Reset-UserIconCache {
 }
 
 function Invoke-ChromeTaskbarAutoRepair {
-    $profiles = Get-ActiveUserProfiles
-    Write-Log 'INFO' 'Arrêt de l''explorateur et des processus Shell pour nettoyage.'
-    foreach ($procName in @('explorer', 'ShellExperienceHost', 'SearchHost', 'SearchApp', 'StartMenuExperienceHost')) {
-        $proc = Get-Process $procName -ErrorAction SilentlyContinue
-        if ($proc) {
-            $proc | Stop-Process -Force -ErrorAction SilentlyContinue
-            Write-Log 'INFO' "Processus arrêté : $procName"
+    # Identifier l'utilisateur interactif
+    $computerSystem = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $interactiveUser = $computerSystem.UserName
+    if (-not $interactiveUser) {
+        Write-Log 'WARNING' 'Aucun utilisateur interactif détecté, impossible de désépingler Chrome de la taskbar.'
+        return
+    }
+    Write-Log 'INFO' "Utilisateur interactif détecté : $interactiveUser"
+    # Créer un script temporaire qui tourne dans le contexte de l'utilisateur
+    $unpinScript = Join-Path $env:TEMP 'UnpinChrome.ps1'
+    $scriptContent = @'
+$taskbarDir = "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"
+if (Test-Path $taskbarDir) {
+    $shell = New-Object -ComObject Shell.Application
+    $folder = $shell.Namespace($taskbarDir)
+    Get-ChildItem $taskbarDir -Filter '*.lnk' | ForEach-Object {
+        $name = [System.IO.Path]::GetFileName($_.FullName)
+        if ($name -match 'chrome') {
+            $item = $folder.ParseName($name)
+            if ($item) {
+                $verb = $item.Verbs() | Where-Object { $_.Name -match 'pingler|Unpin' } | Select-Object -First 1
+                if ($verb) { $verb.DoIt(); Start-Sleep -Milliseconds 500 }
+            }
+            Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
         }
     }
-    Start-Sleep -Seconds 3
-    foreach ($profile in $profiles) {
-        if ($profile.Loaded -or (Test-Path -LiteralPath $profile.LocalPath)) {
-            Reset-UserIconCache -UserProfilePath $profile.LocalPath
+}
+# Supprimer ce script après exécution
+Remove-Item $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
+'@
+    Set-Content -Path $unpinScript -Value $scriptContent -Encoding UTF8 -Force
+    Write-Log 'INFO' "Script de désépinglage créé : $unpinScript"
+    # Créer une tâche planifiée qui s'exécute immédiatement dans la session de l'utilisateur
+    $taskName = 'UnpinChromeTaskbar'
+    try {
+        # Supprimer si elle existe déjà
+        schtasks.exe /Delete /TN $taskName /F 2>&1 | Out-Null
+        # Créer la tâche pour l'utilisateur interactif
+        schtasks.exe /Create /TN $taskName /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$unpinScript`"" /SC ONCE /ST 00:00 /RU $interactiveUser /IT /F 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Log 'SUCCESS' "Tâche planifiée '$taskName' créée pour $interactiveUser"
+            # Exécuter immédiatement
+            schtasks.exe /Run /TN $taskName 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Log 'SUCCESS' "Tâche '$taskName' lancée dans la session de $interactiveUser"
+            }
+            else {
+                Write-Log 'WARNING' "Impossible de lancer la tâche '$taskName' (code $LASTEXITCODE)"
+            }
+            Start-Sleep -Seconds 3
+            # Nettoyer la tâche
+            schtasks.exe /Delete /TN $taskName /F 2>&1 | Out-Null
+            Write-Log 'INFO' "Tâche planifiée '$taskName' supprimée."
+        }
+        else {
+            Write-Log 'ERROR' "Impossible de créer la tâche planifiée (code $LASTEXITCODE)"
         }
     }
-    Start-Process explorer.exe -ErrorAction SilentlyContinue
-    Write-Log 'INFO' 'Explorateur redémarré après nettoyage complet.'
+    catch {
+        Write-Log 'ERROR' "Erreur lors de la gestion de la tâche planifiée : $($_.Exception.Message)"
+    }
 }
 
 function Set-ChromeRestrictionAcl {
@@ -399,21 +443,31 @@ public class TokenPriv {
         $errors = 0
         $items = @(Get-ChildItem -LiteralPath $chromeAppDir -Recurse -Force -ErrorAction SilentlyContinue)
         Write-Log 'INFO' "Application récursive des ACL sur $($items.Count) éléments..."
-        $items | ForEach-Object {
+        foreach ($item in $items) {
             try {
-                $itemAcl = Get-Acl -LiteralPath $_.FullName
+                $itemAcl = Get-Acl -LiteralPath $item.FullName
                 $itemAcl.SetOwner($adminAccount)
-                Set-Acl -LiteralPath $_.FullName -AclObject $itemAcl -ErrorAction Stop
-                $itemAcl = Get-Acl -LiteralPath $_.FullName
+                Set-Acl -LiteralPath $item.FullName -AclObject $itemAcl -ErrorAction Stop
+                $itemAcl = Get-Acl -LiteralPath $item.FullName
                 $itemAcl.SetAccessRuleProtection($true, $false)
-                $itemAcl.Access | ForEach-Object { $itemAcl.RemoveAccessRule($_) | Out-Null }
-                $itemAcl.AddAccessRule($adminRule)
-                $itemAcl.AddAccessRule($systemRule)
-                Set-Acl -LiteralPath $_.FullName -AclObject $itemAcl -ErrorAction Stop
+                foreach ($rule in @($itemAcl.Access)) { $itemAcl.RemoveAccessRule($rule) | Out-Null }
+                if ($item.PSIsContainer) {
+                    $itemAcl.AddAccessRule($adminRule)
+                    $itemAcl.AddAccessRule($systemRule)
+                }
+                else {
+                    $fileAdminRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                        $adminGroup, 'FullControl', 'None', 'None', 'Allow')
+                    $fileSystemRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                        'SYSTEM', 'FullControl', 'None', 'None', 'Allow')
+                    $itemAcl.AddAccessRule($fileAdminRule)
+                    $itemAcl.AddAccessRule($fileSystemRule)
+                }
+                Set-Acl -LiteralPath $item.FullName -AclObject $itemAcl -ErrorAction Stop
             }
             catch {
                 $errors++
-                Write-Log 'WARNING' "ACL non appliquée sur $($_.FullName) : $($_.Exception.Message)"
+                Write-Log 'WARNING' "ACL non appliquée sur $($item.FullName) : $($_.Exception.Message)"
             }
         }
         if ($errors -eq 0) {
