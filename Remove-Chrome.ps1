@@ -173,43 +173,56 @@ if (-not $chromePaths) {
         & icacls $chromeAppDir /reset /T /Q 2>&1 | Out-Null
         Write-Log SUCCESS "  Dossier restauré en permissions normales."
 
-        # 3. Sur chaque .exe : bloquer l'exécution pour les non-admins
-        #    Méthode : couper l'héritage + permissions explicites uniquement
-        #    Admins et SYSTEM = FullControl, Users = rien du tout
-        #    PAS de Deny (un Deny bloquerait aussi l'admin élevé car il est membre de Users)
+        # 3. Bloquer chaque .exe : Admins+SYSTEM = FullControl, Users = Read seul (pas Execute)
+        #    On utilise l'API .NET directement (pas icacls, pas Set-Acl, les deux ont des bugs)
         $exeFiles = Get-ChildItem -LiteralPath $chromeDir -Filter '*.exe' -ErrorAction SilentlyContinue
         foreach ($exe in $exeFiles) {
             $exePath = $exe.FullName
             Write-Log INFO "  Traitement : $($exe.Name)"
 
-            # a) D'abord : supprimer tous les anciens Deny qui bloquent tout le monde
-            $r = & icacls $exePath /remove:d '*S-1-5-32-545' 2>&1
-            Write-Log INFO "    remove deny Users: $($r | Select-Object -First 1)"
-            $r = & icacls $exePath /remove:d '*S-1-5-11' 2>&1
-            Write-Log INFO "    remove deny AuthUsers: $($r | Select-Object -First 1)"
+            try {
+                # Créer un ACL vierge (pas d'héritage, pas de copie)
+                $acl = New-Object System.Security.AccessControl.FileSecurity
+                $acl.SetAccessRuleProtection($true, $false)
 
-            # b) Donner FullControl explicite aux Admins et SYSTEM (AVANT de couper l'héritage)
-            $r = & icacls $exePath /grant '*S-1-5-32-544:(F)' 2>&1
-            Write-Log INFO "    grant Admins(F): $($r | Select-Object -First 1)"
-            $r = & icacls $exePath /grant '*S-1-5-18:(F)' 2>&1
-            Write-Log INFO "    grant SYSTEM(F): $($r | Select-Object -First 1)"
+                # Administrators (S-1-5-32-544) = FullControl
+                $sid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+                $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    $sid, 'FullControl', 'None', 'None', 'Allow')))
 
-            # c) Couper l'héritage (les grants explicites ci-dessus survivent)
-            $r = & icacls $exePath /inheritance:r 2>&1
-            Write-Log INFO "    inheritance:r: $($r | Select-Object -First 1)"
+                # SYSTEM (S-1-5-18) = FullControl
+                $sid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+                $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    $sid, 'FullControl', 'None', 'None', 'Allow')))
 
-            # d) Donner Read seul (PAS Execute) aux Users
-            #    Nécessaire pour que Windows puisse lire le .exe (manifeste, prompt UAC)
-            #    sinon même "Exécuter en tant qu'admin" échoue car Windows ne peut pas
-            #    inspecter le fichier avant l'élévation.
-            #    Read (R) ≠ ReadAndExecute (RX) : R ne permet PAS de lancer le programme.
-            $r = & icacls $exePath /grant '*S-1-5-32-545:(R)' 2>&1
-            Write-Log INFO "    grant Users(R): $($r | Select-Object -First 1)"
+                # Users (S-1-5-32-545) = Read seul (nécessaire pour que l'UAC puisse lire le fichier)
+                $sid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
+                $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+                    $sid, 'Read', 'None', 'None', 'Allow')))
 
-            # e) Vérifier
-            $check = & icacls $exePath
-            Write-Log INFO "    Permissions finales :"
-            $check | ForEach-Object { if ($_.Trim()) { Write-Log INFO "      $_" } }
+                # Appliquer via .NET (pas Set-Acl qui est buggé)
+                [System.IO.File]::SetAccessControl($exePath, $acl)
+                Write-Log SUCCESS "  ACL appliqué sur $($exe.Name) : Admins=Full, Users=Read"
+            }
+            catch {
+                Write-Log ERROR "  Echec ACL sur $($exe.Name) : $($_.Exception.Message)"
+            }
+
+            # Vérification
+            try {
+                $checkAcl = [System.IO.File]::GetAccessControl($exePath)
+                Write-Log INFO "  Permissions finales sur $($exe.Name) :"
+                foreach ($rule in $checkAcl.Access) {
+                    $identity = $rule.IdentityReference
+                    $rights = $rule.FileSystemRights
+                    $type = $rule.AccessControlType
+                    Write-Log INFO "    $identity : $rights ($type)"
+                }
+            }
+            catch {
+                Write-Log WARNING "  Impossible de lire les ACL : $($_.Exception.Message)"
+            }
+        }
         }
     }
 }
