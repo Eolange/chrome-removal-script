@@ -1,44 +1,46 @@
-# Remove-Chrome.ps1
-
-# A PowerShell script to remove Google Chrome and clean up caches.
-
-function Reset-UserIconCacheAggressive {
-    # Reset user icon cache aggressively
-    Stop-Process -Name explorer -Force
-    Remove-Item -Path "$env:APPDATA\\Microsoft\\Windows\\Explorer\\iconcache*" -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
-    Start-Process explorer
+function Reset-UserIconCacheAggressive { 
+    $iconCachePath = "$env:LOCALAPPDATA\Microsoft\Windows\Explorer" 
+    $iconCacheFile = "iconcache*" 
+    Remove-Item "$iconCachePath\$iconCacheFile" -ErrorAction SilentlyContinue 
+    Stop-Process -Name "explorer" -Force -ErrorAction SilentlyContinue 
+    Start-Sleep -Seconds 2 
+    Start-Process "explorer.exe" 
 }
 
-function Set-ChromeRestrictionAcl {
-    param (
-        [string]$path
-    )
-
-    # Explicitly DENY rules to restrict access to Chrome directories
-    $acl = Get-Acl $path
-    $denyRule = New-Object System.Security.AccessControl.FileSystemAccessRule("Everyone", "FullControl", "Deny")
-    $acl.AddAccessRule($denyRule)
-    Set-Acl $path $acl
+function Set-ChromeRestrictionAcl { 
+    $chromePath = "C:\Program Files\Google\Chrome\Application" 
+    $acl = Get-Acl $chromePath 
+    $denyRules = @(
+        "RX", "W", "D", "DC"
+    ) 
+    foreach ($rule in $denyRules) { 
+        $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule("Everyone", $rule, "Deny") 
+        $acl.SetAccessRule($accessRule) 
+    } 
+    Set-Acl $chromePath $acl 
 }
 
-function Remove-Chrome {
-    # Remove Google Chrome application
-    Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force
-    Start-Sleep -Seconds 2
-
-    # Uninstall Chrome using WMIC
-    wmic product where "name='Google Chrome'" call uninstall /nointeractive
-    Start-Sleep -Seconds 5
-
-    # Clean up application data
-    Remove-Item -Path "$env:LOCALAPPDATA\\Google\\Chrome" -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -Path "$env:APPDATA\\Google\\Chrome" -Recurse -Force -ErrorAction SilentlyContinue
-
-    # Aggressively clean cache
-    Get-ChildItem -Path "$env:TEMP" -Recurse | Remove-Item -Force -ErrorAction SilentlyContinue
-    Reset-UserIconCacheAggressive
+function Invoke-ChromeTaskbarAutoRepair { 
+    $taskbarPath = "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\Taskbar" 
+    $chromeShortcut = "Google Chrome.lnk" 
+    if (Test-Path "$taskbarPath\$chromeShortcut") { 
+        Remove-Item "$taskbarPath\$chromeShortcut" -ErrorAction SilentlyContinue 
+        Start-Sleep -Seconds 1 
+    } 
+    $chromeExePath = "C:\Program Files\Google\Chrome\Application\chrome.exe" 
+    Start-Process "$chromeExePath" 
 }
 
-# Main script execution
-Remove-Chrome
+# Reset user icon cache aggressively
+Reset-UserIconCacheAggressive 
+
+# Set Chrome restriction ACL
+Set-ChromeRestrictionAcl 
+
+# Invoke Chrome taskbar auto-repair without explorer restart
+Invoke-ChromeTaskbarAutoRepair 
+
+# Restart Explorer once at the end
+Stop-Process -Name "explorer" -Force 
+Start-Sleep -Seconds 1 
+Start-Process "explorer.exe" 
