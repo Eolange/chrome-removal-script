@@ -206,7 +206,6 @@ if (-not $chromePaths) {
             Write-Log INFO "    Permissions finales :"
             $check | ForEach-Object { if ($_.Trim()) { Write-Log INFO "      $_" } }
         }
-        }
     }
 }
 #endregion
