@@ -105,21 +105,49 @@ function Disable-GoogleTasks {
         }
         if (-not $tasks) {
             Write-Log 'INFO' 'Aucune tâche planifiée liée à Chrome/Google trouvée.'
-            return
         }
-        foreach ($task in $tasks) {
-            try {
-                Disable-ScheduledTask -InputObject $task -ErrorAction SilentlyContinue | Out-Null
-                Unregister-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -Confirm:$false -ErrorAction SilentlyContinue
-                Write-Log 'SUCCESS' "Tâche supprimée : $($task.TaskPath)$($task.TaskName)"
-            }
-            catch {
-                Write-Log 'ERROR' "Impossible de supprimer la tâche $($task.TaskPath)$($task.TaskName) : $($_.Exception.Message)"
+        else {
+            foreach ($task in $tasks) {
+                try {
+                    Disable-ScheduledTask -InputObject $task -ErrorAction SilentlyContinue | Out-Null
+                    Unregister-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -Confirm:$false -ErrorAction SilentlyContinue
+                    Write-Log 'SUCCESS' "Tâche supprimée : $($task.TaskPath)$($task.TaskName)"
+                }
+                catch {
+                    Write-Log 'ERROR' "Impossible de supprimer la tâche $($task.TaskPath)$($task.TaskName) : $($_.Exception.Message)"
+                }
             }
         }
     }
     catch {
         Write-Log 'ERROR' "Erreur lors de la gestion des tâches planifiées : $($_.Exception.Message)"
+    }
+    $googleServices = Get-Service -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -match '^gupdate|^gupdatem|^GoogleChrome'
+    }
+    if (-not $googleServices) {
+        Write-Log 'INFO' 'Aucun service Google Update trouvé.'
+    }
+    else {
+        foreach ($svc in $googleServices) {
+            try {
+                Stop-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
+                Set-Service -Name $svc.Name -StartupType Disabled -ErrorAction Stop
+                Write-Log 'SUCCESS' "Service désactivé : $($svc.Name) ($($svc.DisplayName))"
+            }
+            catch {
+                Write-Log 'ERROR' "Impossible de désactiver le service $($svc.Name) : $($_.Exception.Message)"
+            }
+        }
+    }
+    $googleUpdatePaths = @(
+        "${env:ProgramFiles(x86)}\Google\Update",
+        "${env:ProgramFiles}\Google\Update"
+    )
+    foreach ($updateDir in $googleUpdatePaths) {
+        if (Test-Path -LiteralPath $updateDir) {
+            Remove-ItemSafe -Path $updateDir | Out-Null
+        }
     }
 }
 
@@ -279,17 +307,16 @@ function Reset-UserIconCache {
 
 function Invoke-ChromeTaskbarAutoRepair {
     $profiles = Get-ActiveUserProfiles
-    if (Test-ChromeTaskbarArtifact) {
-        Write-Log 'WARNING' 'Artefact taskbar Chrome détecté, nettoyage du cache d''icônes.'
-        foreach ($profile in $profiles) {
-            if ($profile.Loaded -or (Test-Path -LiteralPath $profile.LocalPath)) {
-                Reset-UserIconCache -UserProfilePath $profile.LocalPath
-            }
+    Write-Log 'INFO' 'Arrêt de l''explorateur pour nettoyage du cache d''icônes.'
+    Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    foreach ($profile in $profiles) {
+        if ($profile.Loaded -or (Test-Path -LiteralPath $profile.LocalPath)) {
+            Reset-UserIconCache -UserProfilePath $profile.LocalPath
         }
     }
-    else {
-        Write-Log 'SUCCESS' 'Aucun artefact taskbar Chrome détecté.'
-    }
+    Start-Process explorer.exe -ErrorAction SilentlyContinue
+    Write-Log 'INFO' 'Explorateur redémarré après nettoyage du cache d''icônes.'
 }
 
 function Set-ChromeRestrictionAcl {
@@ -300,11 +327,14 @@ function Set-ChromeRestrictionAcl {
     $chromeDir = Split-Path -Path $ChromeExePath -Parent
     $chromeAppDir = Split-Path -Path $chromeDir -Parent
     $adminGroup = if (Test-IdentityResolvable -Identity 'Administrateurs') { 'Administrateurs' } else { 'Administrators' }
+    $takeownAnswer = if ((Get-Culture).TwoLetterISOLanguageName -eq 'fr') { 'O' } else { 'Y' }
     Write-Log 'INFO' "Blocage ACL Chrome : $chromeAppDir"
     try {
-        cmd /c "takeown /F `"$chromeAppDir`" /R /A" | Out-Null
-        & icacls.exe "$chromeAppDir" /inheritance:r /T /C /Q | Out-Null
-        & icacls.exe "$chromeAppDir" /grant:r "$adminGroup`:(OI)(CI)F" /grant:r "SYSTEM:(OI)(CI)F" /T /C /Q | Out-Null
+        & takeown.exe /F "$chromeAppDir" /A 2>&1 | Out-Null
+        & icacls.exe "$chromeAppDir" /grant "$adminGroup`:F" /C /Q 2>&1 | Out-Null
+        & takeown.exe /F "$chromeAppDir" /R /A /D $takeownAnswer 2>&1 | Out-Null
+        & icacls.exe "$chromeAppDir" /inheritance:r /T /C /Q 2>&1 | Out-Null
+        & icacls.exe "$chromeAppDir" /grant:r "$adminGroup`:(OI)(CI)F" /grant:r "SYSTEM:(OI)(CI)F" /T /C /Q 2>&1 | Out-Null
         Write-Log 'SUCCESS' "ACL appliquée sur $chromeAppDir : seuls admins + SYSTEM ont accès (dossier et contenu)"
     }
     catch {
@@ -346,7 +376,5 @@ if ($chromeExe) {
 } else {
     Write-Log 'INFO' "Chrome n''est pas installé sur ce poste."
 }
-Restart-ExplorerIfPossible
-Start-Sleep -Seconds 2
 Invoke-ChromeTaskbarAutoRepair
 Write-Log 'SUCCESS' 'Traitement terminé.'
