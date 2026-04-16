@@ -173,24 +173,31 @@ if (-not $chromePaths) {
         & icacls $chromeAppDir /reset /T /Q 2>&1 | Out-Null
         Write-Log SUCCESS "  Dossier restauré en permissions normales."
 
-        # 3. Sur chaque .exe : ajouter un Deny Execute pour le groupe Users
-        #    Le Deny est prioritaire sur les Allow hérités.
-        #    Les admins ne sont PAS affectés car on ajoute aussi un Allow explicite pour eux.
+        # 3. Sur chaque .exe : bloquer l'exécution pour les non-admins
+        #    On utilise les SIDs (universels, marchent sur Windows FR et EN) :
+        #      *S-1-5-32-544 = Administrators/Administrateurs
+        #      *S-1-5-18     = SYSTEM
+        #      *S-1-5-32-545 = Users/Utilisateurs
+        #      *S-1-5-11     = Authenticated Users / Utilisateurs authentifiés
         $exeFiles = Get-ChildItem -LiteralPath $chromeDir -Filter '*.exe' -ErrorAction SilentlyContinue
         foreach ($exe in $exeFiles) {
             $exePath = $exe.FullName
             Write-Log INFO "  Traitement : $($exe.Name)"
 
-            # a) S'assurer que les admins ont un Allow FullControl explicite
-            #    (un Allow explicite pour Admins + un Deny pour Users = admins passent, users bloqués)
-            $r = & icacls $exePath /grant 'BUILTIN\Administrators:(F)' 2>&1
-            Write-Log INFO "    grant Admins: $($r | Select-Object -First 1)"
-            $r = & icacls $exePath /grant 'NT AUTHORITY\SYSTEM:(F)' 2>&1
-            Write-Log INFO "    grant SYSTEM: $($r | Select-Object -First 1)"
+            # a) Donner FullControl explicite aux admins et SYSTEM (via SID)
+            $r = & icacls $exePath /grant '*S-1-5-32-544:(F)' 2>&1
+            Write-Log INFO "    grant Admins(F): $($r | Select-Object -First 1)"
+            $r = & icacls $exePath /grant '*S-1-5-18:(F)' 2>&1
+            Write-Log INFO "    grant SYSTEM(F): $($r | Select-Object -First 1)"
 
-            # b) Ajouter Deny Execute pour Users (bloque l'exécution, pas la lecture)
-            $r = & icacls $exePath /deny 'BUILTIN\Users:(X)' 2>&1
-            Write-Log INFO "    deny Users(X): $($r | Select-Object -First 1)"
+            # b) Deny ReadAndExecute pour Users ET Authenticated Users (via SID)
+            #    Deny est TOUJOURS prioritaire sur Allow, même hérité.
+            #    Les admins passent quand même car ils ont un Allow explicite
+            #    ET leur token élevé contourne le Deny du groupe Users.
+            $r = & icacls $exePath /deny '*S-1-5-32-545:(RX)' 2>&1
+            Write-Log INFO "    deny Users(RX): $($r | Select-Object -First 1)"
+            $r = & icacls $exePath /deny '*S-1-5-11:(RX)' 2>&1
+            Write-Log INFO "    deny AuthUsers(RX): $($r | Select-Object -First 1)"
 
             # c) Vérifier
             $check = & icacls $exePath
