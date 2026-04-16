@@ -371,24 +371,43 @@ function Invoke-ChromeTaskbarAutoRepair {
             $vbsContent = @'
 Set sh = CreateObject("Shell.Application")
 Set wsh = CreateObject("WScript.Shell")
-tb = wsh.ExpandEnvironmentStrings("%APPDATA%") & "\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"
 Set fso = CreateObject("Scripting.FileSystemObject")
-If fso.FolderExists(tb) Then
-    Set folder = sh.Namespace(tb)
-    If Not folder Is Nothing Then
-        For Each item In folder.Items
-            nm = LCase(item.Name)
-            If InStr(nm, "chrome") > 0 Then
-                For Each verb In item.Verbs
-                    If InStr(verb.Name, "pingler") > 0 Or InStr(verb.Name, "Unpin") > 0 Then
-                        verb.DoIt
-                    End If
-                Next
-            End If
-        Next
-    End If
+ql = wsh.ExpandEnvironmentStrings("%APPDATA%") & "\Microsoft\Internet Explorer\Quick Launch"
+tb = ql & "\User Pinned\TaskBar"
+imp = ql & "\User Pinned\ImplicitAppShortcuts"
+Call CleanFolder(tb)
+Call CleanFolder(ql)
+If fso.FolderExists(imp) Then
+    For Each sf In fso.GetFolder(imp).SubFolders
+        Call CleanFolder(sf.Path)
+    Next
 End If
+Set folder = sh.Namespace(tb)
+If Not folder Is Nothing Then
+    For Each item In folder.Items
+        nm = LCase(item.Name)
+        If InStr(nm, "chrome") > 0 Then
+            For Each verb In item.Verbs
+                If InStr(verb.Name, "pingler") > 0 Or InStr(verb.Name, "Unpin") > 0 Then
+                    verb.DoIt
+                End If
+            Next
+        End If
+    Next
+End If
+WScript.Sleep 1000
+wsh.Run "cmd /c taskkill /f /im explorer.exe & start explorer.exe", 0, False
 fso.DeleteFile WScript.ScriptFullName, True
+Sub CleanFolder(p)
+    If Not fso.FolderExists(p) Then Exit Sub
+    For Each f In fso.GetFolder(p).Files
+        If LCase(Right(f.Name,4)) = ".lnk" Then
+            If InStr(LCase(f.Name), "chrome") > 0 Then
+                f.Delete True
+            End If
+        End If
+    Next
+End Sub
 '@
             Set-Content -Path $vbsPath -Value $vbsContent -Encoding ASCII -Force
             Set-ItemProperty -Path $runOncePath -Name 'UnpinChrome' -Value "wscript.exe `"$vbsPath`"" -Type String -ErrorAction Stop
@@ -473,12 +492,12 @@ public class TokenPriv {
         $exeSystemRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
             'SYSTEM', 'FullControl', 'None', 'None', 'Allow')
         $exeUsersReadRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            $usersGroup, 'ReadAndExecute', 'None', 'None', 'Allow')
+            $usersGroup, 'Read', 'None', 'None', 'Allow')
         $exeAcl.AddAccessRule($exeAdminRule)
         $exeAcl.AddAccessRule($exeSystemRule)
         $exeAcl.AddAccessRule($exeUsersReadRule)
         Set-Acl -LiteralPath $ChromeExePath -AclObject $exeAcl -ErrorAction Stop
-        Write-Log 'SUCCESS' "ACL chrome.exe : $adminGroup + SYSTEM FullControl, $usersGroup ReadAndExecute (SRP bloque les non-admins)"
+        Write-Log 'SUCCESS' "ACL chrome.exe : $adminGroup + SYSTEM FullControl, $usersGroup Read seul (SRP bloque exécution non-admins)"
         # Bloquer aussi new_chrome.exe et chrome_proxy.exe s'ils existent
         $otherExes = @('new_chrome.exe', 'chrome_proxy.exe')
         foreach ($exeName in $otherExes) {
@@ -510,7 +529,7 @@ public class TokenPriv {
             $nonAdmin | ForEach-Object { Write-Log 'WARNING' "  -> $($_.IdentityReference) : $($_.FileSystemRights)" }
         }
         else {
-            Write-Log 'SUCCESS' "ACL vérification OK : chrome.exe ($adminGroup + SYSTEM FullControl, $usersGroup ReadAndExecute)"
+            Write-Log 'SUCCESS' "ACL vérification OK : chrome.exe ($adminGroup + SYSTEM FullControl, $usersGroup Read)"
         }
     }
     catch {
