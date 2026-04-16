@@ -368,19 +368,19 @@ function Invoke-ChromeTaskbarAutoRepair {
                 New-Item -Path $runOncePath -Force -ErrorAction Stop | Out-Null
             }
             $vbsPath = Join-Path $profile.LocalPath 'AppData\Local\Temp\UnpinChrome.vbs'
-            $vbsContent = @"
-Set sh = CreateObject(""Shell.Application"")
-Set wsh = CreateObject(""WScript.Shell"")
-tb = wsh.ExpandEnvironmentStrings(""%APPDATA%"") & ""\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar""
-Set fso = CreateObject(""Scripting.FileSystemObject"")
+            $vbsContent = @'
+Set sh = CreateObject("Shell.Application")
+Set wsh = CreateObject("WScript.Shell")
+tb = wsh.ExpandEnvironmentStrings("%APPDATA%") & "\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"
+Set fso = CreateObject("Scripting.FileSystemObject")
 If fso.FolderExists(tb) Then
     Set folder = sh.Namespace(tb)
     If Not folder Is Nothing Then
         For Each item In folder.Items
             nm = LCase(item.Name)
-            If InStr(nm, ""chrome"") > 0 Then
+            If InStr(nm, "chrome") > 0 Then
                 For Each verb In item.Verbs
-                    If InStr(verb.Name, ""pingler"") > 0 Or InStr(verb.Name, ""Unpin"") > 0 Then
+                    If InStr(verb.Name, "pingler") > 0 Or InStr(verb.Name, "Unpin") > 0 Then
                         verb.DoIt
                     End If
                 Next
@@ -389,7 +389,7 @@ If fso.FolderExists(tb) Then
     End If
 End If
 fso.DeleteFile WScript.ScriptFullName, True
-"@
+'@
             Set-Content -Path $vbsPath -Value $vbsContent -Encoding ASCII -Force
             Set-ItemProperty -Path $runOncePath -Name 'UnpinChrome' -Value "wscript.exe `"$vbsPath`"" -Type String -ErrorAction Stop
             Write-Log 'SUCCESS' "RunOnce enregistré pour $($profile.LocalPath) : l''icône Chrome sera supprimée au prochain logon"
@@ -473,12 +473,12 @@ public class TokenPriv {
         $exeSystemRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
             'SYSTEM', 'FullControl', 'None', 'None', 'Allow')
         $exeUsersReadRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            $usersGroup, 'Read', 'None', 'None', 'Allow')
+            $usersGroup, 'ReadAndExecute', 'None', 'None', 'Allow')
         $exeAcl.AddAccessRule($exeAdminRule)
         $exeAcl.AddAccessRule($exeSystemRule)
         $exeAcl.AddAccessRule($exeUsersReadRule)
         Set-Acl -LiteralPath $ChromeExePath -AclObject $exeAcl -ErrorAction Stop
-        Write-Log 'SUCCESS' "ACL chrome.exe : $adminGroup + SYSTEM FullControl, $usersGroup Read seul (pas d''exécution)"
+        Write-Log 'SUCCESS' "ACL chrome.exe : $adminGroup + SYSTEM FullControl, $usersGroup ReadAndExecute (SRP bloque les non-admins)"
         # Bloquer aussi new_chrome.exe et chrome_proxy.exe s'ils existent
         $otherExes = @('new_chrome.exe', 'chrome_proxy.exe')
         foreach ($exeName in $otherExes) {
@@ -510,11 +510,51 @@ public class TokenPriv {
             $nonAdmin | ForEach-Object { Write-Log 'WARNING' "  -> $($_.IdentityReference) : $($_.FileSystemRights)" }
         }
         else {
-            Write-Log 'SUCCESS' "ACL vérification OK : chrome.exe ($adminGroup + SYSTEM FullControl, $usersGroup Read)"
+            Write-Log 'SUCCESS' "ACL vérification OK : chrome.exe ($adminGroup + SYSTEM FullControl, $usersGroup ReadAndExecute)"
         }
     }
     catch {
         Write-Log 'ERROR' "Blocage ACL Chrome échoué : $($_.Exception.Message)"
+    }
+}
+
+function Set-ChromeSoftwareRestriction {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ChromeExePath
+    )
+    $srpBase = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers'
+    try {
+        if (-not (Test-Path $srpBase)) {
+            New-Item -Path $srpBase -Force -ErrorAction Stop | Out-Null
+        }
+        $current = Get-ItemProperty -Path $srpBase -ErrorAction SilentlyContinue
+        if ($null -eq $current.DefaultLevel) {
+            Set-ItemProperty -Path $srpBase -Name 'DefaultLevel' -Value 262144 -Type DWord
+        }
+        Set-ItemProperty -Path $srpBase -Name 'PolicyScope' -Value 1 -Type DWord
+        if ($null -eq $current.TransparentEnabled) {
+            Set-ItemProperty -Path $srpBase -Name 'TransparentEnabled' -Value 0 -Type DWord
+        }
+        $pathsBase = "$srpBase\0\Paths"
+        if (-not (Test-Path $pathsBase)) {
+            New-Item -Path $pathsBase -Force -ErrorAction Stop | Out-Null
+        }
+        $rules = @(
+            @{ Guid = '{B4A2D3A1-5C6D-4E8F-9A0B-1C2D3E4F5A6B}'; Path = "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe" },
+            @{ Guid = '{B4A2D3A1-5C6D-4E8F-9A0B-1C2D3E4F5A6C}'; Path = "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe" }
+        )
+        foreach ($rule in $rules) {
+            if (-not $rule.Path) { continue }
+            $rulePath = Join-Path $pathsBase $rule.Guid
+            New-Item -Path $rulePath -Force -ErrorAction Stop | Out-Null
+            Set-ItemProperty -Path $rulePath -Name 'ItemData' -Value $rule.Path -Type String
+            Set-ItemProperty -Path $rulePath -Name 'SaferFlags' -Value 0 -Type DWord
+            Write-Log 'SUCCESS' "SRP : chrome.exe bloqué pour non-admins ($($rule.Path))"
+        }
+    }
+    catch {
+        Write-Log 'ERROR' "Impossible de configurer SRP : $($_.Exception.Message)"
     }
 }
 
@@ -550,6 +590,7 @@ $chromeExe = Get-ChromeExePath
 if ($chromeExe) {
     Write-Log 'INFO' "Chrome trouvé : $chromeExe"
     Set-ChromeRestrictionAcl -ChromeExePath $chromeExe
+    Set-ChromeSoftwareRestriction -ChromeExePath $chromeExe
 } else {
     Write-Log 'INFO' "Chrome n''est pas installé sur ce poste."
 }
