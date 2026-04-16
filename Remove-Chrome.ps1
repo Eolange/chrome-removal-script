@@ -232,39 +232,41 @@ function Remove-ChromeTaskbarPins {
     }
     foreach ($profile in $profiles) {
         Write-Log 'INFO' "Traitement taskbar pour : $($profile.LocalPath)"
-        $taskbarDir = Join-Path $profile.LocalPath 'AppData\Roaming\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar'
-        try {
-            if (-not (Test-Path -LiteralPath $taskbarDir)) {
-                Write-Log 'INFO' "Dossier TaskBar introuvable : $taskbarDir"
-                continue
-            }
-            $shell = New-Object -ComObject Shell.Application
-            $folder = $shell.Namespace($taskbarDir)
-            $links = Get-ChildItem -LiteralPath $taskbarDir -Filter '*.lnk' -ErrorAction SilentlyContinue
-            foreach ($lnk in $links) {
-                $isChrome = Test-IsChromeShortcut -LinkPath $lnk.FullName -WshShell $wshShell
-                if (-not $isChrome) { continue }
-                $item = $folder.ParseName($lnk.Name)
-                $unpinned = $false
-                if ($item) {
-                    $unpinVerb = $item.Verbs() | Where-Object {
-                        $_.Name -match 'Désépingler de la barre des tâches|Unpin from taskbar'
-                    } | Select-Object -First 1
-                    if ($unpinVerb) {
-                        $unpinVerb.DoIt()
-                        Start-Sleep -Milliseconds 500
-                        $unpinned = $true
-                        Write-Log 'SUCCESS' "Chrome désépinglé proprement : $($lnk.FullName)"
-                    }
-                }
-                if (-not $unpinned) {
-                    Remove-ItemSafe -Path $lnk.FullName | Out-Null
-                    Write-Log 'WARNING' "Suppression directe du raccourci (fallback) : $($lnk.FullName)"
-                }
+        $quickLaunchRoot = Join-Path $profile.LocalPath 'AppData\Roaming\Microsoft\Internet Explorer\Quick Launch'
+        # Liste des dossiers à nettoyer
+        $dirsToClean = @(
+            (Join-Path $quickLaunchRoot 'User Pinned\TaskBar'),
+            $quickLaunchRoot
+        )
+        # Ajouter les sous-dossiers de ImplicitAppShortcuts
+        $implicitDir = Join-Path $quickLaunchRoot 'User Pinned\ImplicitAppShortcuts'
+        if (Test-Path -LiteralPath $implicitDir) {
+            Get-ChildItem -LiteralPath $implicitDir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                $dirsToClean += $_.FullName
             }
         }
-        catch {
-            Write-Log 'WARNING' "Impossible de nettoyer la taskbar pour $($profile.LocalPath) : $($_.Exception.Message)"
+        foreach ($dir in $dirsToClean) {
+            try {
+                if (-not (Test-Path -LiteralPath $dir)) { continue }
+                $links = Get-ChildItem -LiteralPath $dir -Filter '*.lnk' -ErrorAction SilentlyContinue
+                foreach ($lnk in $links) {
+                    $isChrome = Test-IsChromeShortcut -LinkPath $lnk.FullName -WshShell $wshShell
+                    if (-not $isChrome) { continue }
+                    Remove-ItemSafe -Path $lnk.FullName | Out-Null
+                    Write-Log 'SUCCESS' "Raccourci Chrome supprimé : $($lnk.FullName)"
+                }
+                # Supprimer les dossiers ImplicitAppShortcuts vides après nettoyage
+                if ($dir -match 'ImplicitAppShortcuts\\' -and (Test-Path -LiteralPath $dir)) {
+                    $remaining = Get-ChildItem -LiteralPath $dir -ErrorAction SilentlyContinue
+                    if (-not $remaining) {
+                        Remove-Item -LiteralPath $dir -Force -ErrorAction SilentlyContinue
+                        Write-Log 'INFO' "Dossier ImplicitAppShortcuts vide supprimé : $dir"
+                    }
+                }
+            }
+            catch {
+                Write-Log 'WARNING' "Impossible de nettoyer $dir : $($_.Exception.Message)"
+            }
         }
     }
     $allUsersStartMenu = "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Google Chrome.lnk"
@@ -317,66 +319,45 @@ function Reset-UserIconCache {
 }
 
 function Invoke-ChromeTaskbarAutoRepair {
-    # Identifier l'utilisateur interactif
-    $computerSystem = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
-    $interactiveUser = $computerSystem.UserName
-    if (-not $interactiveUser) {
-        Write-Log 'WARNING' 'Aucun utilisateur interactif détecté, impossible de désépingler Chrome de la taskbar.'
-        return
-    }
-    Write-Log 'INFO' "Utilisateur interactif détecté : $interactiveUser"
-    # Créer un script temporaire qui tourne dans le contexte de l'utilisateur
-    $unpinScript = Join-Path $env:TEMP 'UnpinChrome.ps1'
-    $scriptContent = @'
-$taskbarDir = "$env:APPDATA\Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"
-if (Test-Path $taskbarDir) {
-    $shell = New-Object -ComObject Shell.Application
-    $folder = $shell.Namespace($taskbarDir)
-    Get-ChildItem $taskbarDir -Filter '*.lnk' | ForEach-Object {
-        $name = [System.IO.Path]::GetFileName($_.FullName)
-        if ($name -match 'chrome') {
-            $item = $folder.ParseName($name)
-            if ($item) {
-                $verb = $item.Verbs() | Where-Object { $_.Name -match 'pingler|Unpin' } | Select-Object -First 1
-                if ($verb) { $verb.DoIt(); Start-Sleep -Milliseconds 500 }
+    # Nettoyage complémentaire : supprimer tout raccourci Chrome résiduel dans les profils
+    $profiles = Get-ActiveUserProfiles
+    $wshShell = $null
+    try { $wshShell = New-Object -ComObject WScript.Shell } catch {}
+    $totalRemoved = 0
+    foreach ($profile in $profiles) {
+        $quickLaunchRoot = Join-Path $profile.LocalPath 'AppData\Roaming\Microsoft\Internet Explorer\Quick Launch'
+        if (-not (Test-Path -LiteralPath $quickLaunchRoot)) { continue }
+        # Rechercher récursivement tous les .lnk Chrome dans Quick Launch
+        try {
+            $allLinks = Get-ChildItem -LiteralPath $quickLaunchRoot -Filter '*.lnk' -Recurse -Force -ErrorAction SilentlyContinue
+            foreach ($lnk in $allLinks) {
+                if (Test-IsChromeShortcut -LinkPath $lnk.FullName -WshShell $wshShell) {
+                    Remove-Item -LiteralPath $lnk.FullName -Force -ErrorAction SilentlyContinue
+                    Write-Log 'SUCCESS' "Raccourci Chrome résiduel supprimé : $($lnk.FullName)"
+                    $totalRemoved++
+                }
             }
-            Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+        }
+        catch {
+            Write-Log 'WARNING' "Impossible de parcourir $quickLaunchRoot : $($_.Exception.Message)"
+        }
+        # Nettoyer les dossiers ImplicitAppShortcuts vides
+        $implicitDir = Join-Path $quickLaunchRoot 'User Pinned\ImplicitAppShortcuts'
+        if (Test-Path -LiteralPath $implicitDir) {
+            Get-ChildItem -LiteralPath $implicitDir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                $remaining = Get-ChildItem -LiteralPath $_.FullName -ErrorAction SilentlyContinue
+                if (-not $remaining) {
+                    Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+                    Write-Log 'INFO' "Dossier vide supprimé : $($_.FullName)"
+                }
+            }
         }
     }
-}
-# Supprimer ce script après exécution
-Remove-Item $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
-'@
-    Set-Content -Path $unpinScript -Value $scriptContent -Encoding UTF8 -Force
-    Write-Log 'INFO' "Script de désépinglage créé : $unpinScript"
-    # Créer une tâche planifiée qui s'exécute immédiatement dans la session de l'utilisateur
-    $taskName = 'UnpinChromeTaskbar'
-    try {
-        # Supprimer si elle existe déjà
-        schtasks.exe /Delete /TN $taskName /F 2>&1 | Out-Null
-        # Créer la tâche pour l'utilisateur interactif
-        schtasks.exe /Create /TN $taskName /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$unpinScript`"" /SC ONCE /ST 00:00 /RU $interactiveUser /IT /F 2>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
-            Write-Log 'SUCCESS' "Tâche planifiée '$taskName' créée pour $interactiveUser"
-            # Exécuter immédiatement
-            schtasks.exe /Run /TN $taskName 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) {
-                Write-Log 'SUCCESS' "Tâche '$taskName' lancée dans la session de $interactiveUser"
-            }
-            else {
-                Write-Log 'WARNING' "Impossible de lancer la tâche '$taskName' (code $LASTEXITCODE)"
-            }
-            Start-Sleep -Seconds 3
-            # Nettoyer la tâche
-            schtasks.exe /Delete /TN $taskName /F 2>&1 | Out-Null
-            Write-Log 'INFO' "Tâche planifiée '$taskName' supprimée."
-        }
-        else {
-            Write-Log 'ERROR' "Impossible de créer la tâche planifiée (code $LASTEXITCODE)"
-        }
+    if ($totalRemoved -eq 0) {
+        Write-Log 'INFO' 'Aucun raccourci Chrome résiduel trouvé.'
     }
-    catch {
-        Write-Log 'ERROR' "Erreur lors de la gestion de la tâche planifiée : $($_.Exception.Message)"
+    else {
+        Write-Log 'SUCCESS' "$totalRemoved raccourci(s) Chrome résiduel(s) supprimé(s)."
     }
 }
 
@@ -478,7 +459,7 @@ public class TokenPriv {
         }
         # Vérification
         $testAcl = Get-Acl -LiteralPath $chromeAppDir
-        $nonAdmin = $testAcl.Access | Where-Object { $_.IdentityReference -notmatch "SYSTEM|$([regex]::Escape($adminGroup))|BUILTIN" }
+        $nonAdmin = $testAcl.Access | Where-Object { $_.IdentityReference -notmatch "SYSTEM|Syst.me|AUTORITE|$([regex]::Escape($adminGroup))|BUILTIN" }
         if ($nonAdmin) {
             Write-Log 'WARNING' "ACL vérification : des permissions non-admin subsistent sur $chromeAppDir"
             $nonAdmin | ForEach-Object { Write-Log 'WARNING' "  -> $($_.IdentityReference) : $($_.FileSystemRights)" }
